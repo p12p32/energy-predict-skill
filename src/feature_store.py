@@ -4,6 +4,8 @@ import numpy as np
 from typing import Optional, List
 from src.db import DorisDB
 from src.config_loader import load_config
+from src.holiday_utils import add_holiday_features, add_cyclical_features
+from src.data_quality import DataQuality
 
 PREDICTION_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS energy_predictions (
@@ -45,6 +47,17 @@ CREATE TABLE IF NOT EXISTS energy_feature_store (
     value_rolling_mean_24h DOUBLE  COMMENT '24小时滑动均值',
     value_diff_1d   DOUBLE        COMMENT '日环比变化',
     value_diff_7d   DOUBLE        COMMENT '周环比变化',
+    is_holiday      BOOLEAN       COMMENT '是否节假日',
+    is_work_weekend BOOLEAN       COMMENT '是否调休工作日',
+    days_to_holiday TINYINT       COMMENT '距下一节假日天数',
+    days_from_holiday TINYINT     COMMENT '距上一节假日天数',
+    hour_sin        DOUBLE        COMMENT '小时sin编码',
+    hour_cos        DOUBLE        COMMENT '小时cos编码',
+    dow_sin         DOUBLE        COMMENT '星期sin编码',
+    dow_cos         DOUBLE        COMMENT '星期cos编码',
+    month_sin       DOUBLE        COMMENT '月sin编码',
+    month_cos       DOUBLE        COMMENT '月cos编码',
+    quality_flag    TINYINT       COMMENT '数据质量标记(0=正常,1=疑似,2=异常)',
     INDEX idx_province_dt (province, dt) USING BITMAP
 )
 DUPLICATE KEY (dt, province, type)
@@ -81,6 +94,11 @@ class FeatureEngineer:
         df = raw.copy()
         df = df.sort_values(["province", "type", "dt"]).reset_index(drop=True)
 
+        # ── 数据质量检测 ──
+        dq = DataQuality()
+        df = dq.detect(df, "value")
+
+        # ── 时间特征 ──
         df["hour"] = df["dt"].dt.hour
         df["day_of_week"] = df["dt"].dt.dayofweek
         df["day_of_month"] = df["dt"].dt.day
@@ -93,6 +111,13 @@ class FeatureEngineer:
                       3 if m in [9, 10, 11] else 4
         )
 
+        # ── 节假日特征 ──
+        df = add_holiday_features(df)
+
+        # ── 周期编码 ──
+        df = add_cyclical_features(df)
+
+        # ── 滞后特征 ──
         for group_key, group_df in df.groupby(["province", "type"]):
             idx = group_df.index
 
@@ -139,6 +164,11 @@ class FeatureStore:
             "value_lag_1d", "value_lag_7d",
             "value_rolling_mean_24h",
             "value_diff_1d", "value_diff_7d",
+            "is_holiday", "is_work_weekend",
+            "days_to_holiday", "days_from_holiday",
+            "hour_sin", "hour_cos", "dow_sin", "dow_cos",
+            "month_sin", "month_cos",
+            "quality_flag",
         ]
         available = [c for c in cols if c in df.columns]
         return self.db.insert_dataframe(
