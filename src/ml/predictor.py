@@ -1,11 +1,12 @@
-"""predictor.py — 预测执行器: 未来特征外推 + 残差概率区间 + 趋势集成"""
+"""predictor.py — 预测执行器: 未来特征外推 + 分位数预测 + 趋势集成 + ECM"""
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 from src.ml.trainer import Trainer
 from src.ml.trend import TrendModel
+from src.ml.error_correction import ErrorCorrectionModel
 from src.data.features import FeatureStore
 from src.data.fetcher import DataFetcher
 from src.core.config import load_config
@@ -21,7 +22,6 @@ class Predictor:
     def predict(self, province: str, target_type: str,
                 horizon_hours: int = 24,
                 model_version: str = None) -> pd.DataFrame:
-        model, feature_names, _ = self.trainer.load_model(province, target_type)
         horizon_steps = min(horizon_hours * 4, 96)
 
         lookback_days = 14
@@ -41,17 +41,46 @@ class Predictor:
             history, province, target_type, horizon_steps, end_date
         )
 
-        lgb_result = self._predict_with_model(
-            model, future_features, feature_names,
-            province=province, target_type=target_type,
-            history=history,
-        )
+        # ── 尝试分位数模型 ──
+        try:
+            quantile_models = self.trainer.load_quantile_models(province, target_type)
+            predictions = self._predict_quantile(quantile_models, future_features,
+                                                  province, target_type)
+        except (FileNotFoundError, KeyError):
+            # 回退: 单模型 + 残差概率区间
+            model, feature_names, _ = self.trainer.load_model(province, target_type)
+            predictions = self._predict_with_model(
+                model, future_features, feature_names,
+                province=province, target_type=target_type, history=history,
+            )
 
         trend_pred = self._predict_trend(history, horizon_steps)
-        ensemble = self._ensemble(lgb_result, trend_pred, history)
+        ensemble = self._ensemble(predictions, trend_pred, history)
         self.store.insert_predictions(ensemble)
 
         return ensemble
+
+    def _predict_quantile(self, models: Dict, features_df: pd.DataFrame,
+                           province: str, target_type: str) -> pd.DataFrame:
+        """用分位数模型做预测."""
+        p10_model, feature_names = models.get("p10", (None, None))
+        p50_model, _ = models.get("p50", (None, None))
+        p90_model, _ = models.get("p90", (None, None))
+
+        if p50_model is None:
+            raise ValueError("无 P50 模型")
+
+        X = features_df[feature_names].values
+
+        result = pd.DataFrame({
+            "dt": features_df["dt"].values,
+            "province": province, "type": target_type,
+            "p10": np.maximum(p10_model.predict(X), 0) if p10_model else np.zeros(len(X)),
+            "p50": np.maximum(p50_model.predict(X), 0),
+            "p90": np.maximum(p90_model.predict(X), 0) if p90_model else np.zeros(len(X)),
+            "model_version": "quantile_v1",
+        })
+        return result
 
     def _predict_trend(self, history: pd.DataFrame,
                        horizon_steps: int) -> np.ndarray:

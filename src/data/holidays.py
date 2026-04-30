@@ -151,3 +151,99 @@ def add_cyclical_features(df: pd.DataFrame) -> pd.DataFrame:
         df["dom_cos"] = np.cos(2 * np.pi * df["day_of_month"] / 31)
 
     return df
+
+
+# ============================================================
+# 深度日历特征
+# ============================================================
+
+# 寒暑假区间 (近似，中国中小学标准)
+SCHOOL_HOLIDAY_RANGES = [
+    ("01-15", "02-28"),  # 寒假
+    ("07-01", "08-31"),  # 暑假
+]
+
+
+def is_bridge_day(dt) -> bool:
+    """判断是否为桥接日: 工作日夹在节假日和周末之间."""
+    if hasattr(dt, "strftime"):
+        date_str = dt.strftime("%Y-%m-%d")
+        d = dt
+    else:
+        date_str = str(dt)[:10]
+        d = date.fromisoformat(date_str)
+
+    weekday = d.weekday()  # 0=Monday
+    # 不是周末 且 前后有假日
+    if weekday >= 5:
+        return False
+
+    prev_day = d - timedelta(days=1)
+    next_day = d + timedelta(days=1)
+
+    prev_holiday = prev_day.strftime("%Y-%m-%d") in _holiday_set or prev_day.weekday() >= 5
+    next_holiday = next_day.strftime("%Y-%m-%d") in _holiday_set or next_day.weekday() >= 5
+
+    return prev_holiday and next_holiday and not is_holiday(dt)
+
+
+def is_school_holiday(dt) -> bool:
+    """判断是否为寒暑假."""
+    if hasattr(dt, "strftime"):
+        month_day = dt.strftime("%m-%d")
+    else:
+        month_day = str(dt)[5:10]
+
+    for start, end in SCHOOL_HOLIDAY_RANGES:
+        if start <= month_day <= end:
+            return True
+    return False
+
+
+def working_day_type(dt) -> int:
+    """返回工作日类型: 0=周一, 1=正常工作日, 2=周五, 3=节前, 4=节后, 5=周末, 6=假日."""
+    if is_holiday(dt):
+        return 6
+    if hasattr(dt, "weekday"):
+        wd = dt.weekday()
+    else:
+        wd = date.fromisoformat(str(dt)[:10]).weekday()
+
+    if wd >= 5:
+        return 5
+
+    # 节前/节后三天
+    if hasattr(dt, "strftime"):
+        date_str = dt.strftime("%Y-%m-%d")
+        d = dt.date() if hasattr(dt, "date") else date.fromisoformat(date_str)
+    else:
+        date_str = str(dt)[:10]
+        d = date.fromisoformat(date_str)
+
+    for offset in range(1, 4):
+        if (d + timedelta(days=offset)).strftime("%Y-%m-%d") in _holiday_set:
+            return 3  # 节前
+        if (d - timedelta(days=offset)).strftime("%Y-%m-%d") in _holiday_set:
+            return 4  # 节后
+
+    if is_bridge_day(dt):
+        return 3  # 桥接日同节前
+
+    if wd == 0:
+        return 0  # 周一
+    if wd == 4:
+        return 2  # 周五
+    return 1  # 正常工作日
+
+
+def add_deep_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
+    """添加深度日历特征: bridge_day, school_holiday, working_day_type."""
+    result = df.copy()
+    if "dt" not in result.columns:
+        return result
+
+    result["bridge_day"] = result["dt"].apply(is_bridge_day)
+    result["school_holiday"] = result["dt"].apply(is_school_holiday)
+    result["working_day_type"] = result["dt"].apply(working_day_type)
+
+    return result

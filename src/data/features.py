@@ -2,8 +2,9 @@
 import pandas as pd
 import numpy as np
 from typing import Optional, List
-from src.data.holidays import add_holiday_features, add_cyclical_features
+from src.data.holidays import add_holiday_features, add_cyclical_features, add_deep_calendar_features
 from src.data.quality import DataQuality
+from src.data.weather_features import WeatherFeatureEngineer
 
 PREDICTION_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS energy_predictions (
@@ -109,8 +110,13 @@ class FeatureEngineer:
                       3 if m in [9, 10, 11] else 4
         )
 
-        # ── 节假日特征 ──
+        # ── 深度天气特征 ──
+        wfe = WeatherFeatureEngineer()
+        df = wfe.transform(df)
+
+        # ── 节假日 + 深度日历 ──
         df = add_holiday_features(df)
+        df = add_deep_calendar_features(df)
 
         # ── 周期编码 ──
         df = add_cyclical_features(df)
