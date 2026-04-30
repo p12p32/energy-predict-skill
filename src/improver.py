@@ -230,28 +230,53 @@ class Improver:
     #  实验执行（集成 StrategyExecutor）
     # ================================================================
 
+    FEATURE_STRATEGIES = {"polynomial_features", "dayofweek_interaction",
+                          "rolling_window_features"}
+    DATA_STRATEGIES = {"recent_upsample", "extreme_oversample",
+                       "holiday_oversample", "shorter_window"}
+
     def run_experiment(self, hypothesis: Dict, df: pd.DataFrame,
                        province: str, target_type: str,
                        target_col: str = "value") -> Dict:
-        """执行单个假设的实验：数据变换 → 快速训练 → 回测打分."""
+        """执行单个假设的实验。
+
+        修复时序泄漏:
+        - 先按时间切分 train/test
+        - 数据级变换(过采样/窗口)只应用于训练集
+        - 特征级变换(多项式/交互/滑动)同时应用于训练集和测试集(保证列一致)
+        - 不再 shuffle，保持时序顺序
+        """
         try:
-            # ── 1. 数据变换 ──
-            transformed = self.executor.execute(df.copy(), hypothesis)
+            name = hypothesis.get("name", "")
+            df = df.sort_values("dt").reset_index(drop=True)
 
-            # ── 2. 快速训练（数据级变换影响所有数据，特征级变换只影响训练数据）──
-            model_params = self._extract_model_params(hypothesis)
-
-            total = len(transformed)
+            # ── 1. 先做时序切分 ──
+            total = len(df)
             test_steps = min(96, total // 5)
-            train_df = transformed.iloc[:-test_steps]
-            test_df = transformed.iloc[-test_steps:]
+            train_df_orig = df.iloc[:-test_steps].copy()
+            test_df_orig = df.iloc[-test_steps:].copy()
+
+            # ── 2. 根据策略类型，分别变换训练集和测试集 ──
+            if name in self.FEATURE_STRATEGIES:
+                train_df = self.executor.execute(train_df_orig, hypothesis)
+                test_df = self.executor.execute(test_df_orig, hypothesis)
+            elif name in self.DATA_STRATEGIES:
+                train_df = self.executor.execute(train_df_orig, hypothesis)
+                test_df = test_df_orig  # 测试集不加过采样/窗口过滤
+            else:
+                # 模型级/后处理策略: 数据不变
+                train_df = train_df_orig
+                test_df = test_df_orig
+
+            # ── 3. 快速训练 ──
+            model_params = self._extract_model_params(hypothesis)
 
             bt_result = self.trainer.quick_train(
                 train_df, province, target_type, target_col,
                 params=model_params,
             )
 
-            # ── 3. 预测评估 ──
+            # ── 4. 预测评估 ──
             test_features = test_df[bt_result["feature_names"]].values
             pred = bt_result["model"].predict(test_features)
             actual = test_df[target_col].values

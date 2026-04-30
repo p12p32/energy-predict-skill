@@ -115,7 +115,7 @@ class StrategyExecutor:
         upsampled = [df] + copies
 
         result = pd.concat(upsampled, ignore_index=True)
-        return result.sample(frac=1, random_state=42).reset_index(drop=True)
+        return result.sort_values("dt", ascending=True).reset_index(drop=True)
 
     def _exec_extreme_oversample(self, df: pd.DataFrame,
                                   params: Dict) -> pd.DataFrame:
@@ -141,7 +141,7 @@ class StrategyExecutor:
         copies = [extreme] * (factor - 1)
 
         result = pd.concat([df] + copies, ignore_index=True)
-        return result.sample(frac=1, random_state=42).reset_index(drop=True)
+        return result.sort_values("dt", ascending=True).reset_index(drop=True)
 
     def _exec_holiday_oversample(self, df: pd.DataFrame,
                                   params: Dict) -> pd.DataFrame:
@@ -161,7 +161,7 @@ class StrategyExecutor:
         copies = [holiday_samples] * (weight - 1)
 
         result = pd.concat([df] + copies, ignore_index=True)
-        return result.sample(frac=1, random_state=42).reset_index(drop=True)
+        return result.sort_values("dt", ascending=True).reset_index(drop=True)
 
     def _exec_shorter_window(self, df: pd.DataFrame,
                               params: Dict) -> pd.DataFrame:
