@@ -2,7 +2,7 @@
 import pymysql
 import pandas as pd
 from typing import Optional, Dict, Any
-from src.config_loader import get_doris_config
+from src.core.config import get_doris_config
 
 
 class DorisDB:

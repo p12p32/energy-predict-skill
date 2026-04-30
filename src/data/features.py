@@ -2,10 +2,10 @@
 import pandas as pd
 import numpy as np
 from typing import Optional, List
-from src.db import DorisDB
-from src.config_loader import load_config
-from src.holiday_utils import add_holiday_features, add_cyclical_features
-from src.data_quality import DataQuality
+from src.core.db import DorisDB
+from src.core.config import load_config
+from src.data.holidays import add_holiday_features, add_cyclical_features
+from src.data.quality import DataQuality
 
 PREDICTION_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS energy_predictions (

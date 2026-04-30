@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-from src.trainer import Trainer
+from src.ml.trainer import Trainer
 
 
 class Backtester:

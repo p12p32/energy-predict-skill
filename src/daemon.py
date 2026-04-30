@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List
 
 from src.orchestrator import Orchestrator
-from src.config_loader import get_provinces, get_types
+from src.core.config import get_provinces, get_types
 
 logging.basicConfig(
     level=logging.INFO,

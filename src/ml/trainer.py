@@ -10,7 +10,7 @@ import numpy as np
 import lightgbm as lgb
 from sklearn.model_selection import train_test_split
 
-from src.config_loader import get_model_config
+from src.core.config import get_model_config
 
 EXCLUDE_COLS = {"dt", "province", "type", "price"}
 
