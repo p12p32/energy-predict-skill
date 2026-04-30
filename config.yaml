@@ -1,0 +1,60 @@
+# config.yaml — 全局配置
+doris:
+  host: "127.0.0.1"
+  port: 9030
+  user: "root"
+  password: ""
+  database: "energy"
+
+data:
+  source_table: "energy_raw"
+  prediction_table: "energy_predictions"
+  feature_table: "energy_feature_store"
+  strategy_table: "strategy_knowledge"
+
+model:
+  storage_dir: "models"
+  default_window_days: 90
+  forecast_horizon_hours: 96
+
+validator:
+  short_term_mape_threshold: 0.05
+  mid_term_mape_threshold: 0.10
+  consecutive_bias_trigger: 3
+
+improver:
+  max_hypotheses: 12
+  improvement_threshold: 0.05
+  robustness_multiplier: 1.05
+
+provinces:
+  - 广东
+  - 云南
+  - 四川
+  - 江苏
+  - 山东
+  - 浙江
+  - 河南
+
+types:
+  - output
+  - load
+  - price
+
+external_data:
+  weather:
+    source: "open-meteo"
+    qweather_api_key: ""
+  coal_price:
+    enabled: false
+  carbon_price:
+    enabled: false
+
+province_coords:
+  广东: { lat: 23.13, lon: 113.26 }
+  云南: { lat: 25.04, lon: 102.72 }
+  四川: { lat: 30.57, lon: 104.07 }
+  江苏: { lat: 32.06, lon: 118.80 }
+  山东: { lat: 36.67, lon: 116.98 }
+  浙江: { lat: 30.27, lon: 120.15 }
+  河南: { lat: 34.77, lon: 113.65 }
