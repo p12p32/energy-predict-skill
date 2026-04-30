@@ -1,4 +1,4 @@
-"""trainer.py — 模型训练器（LightGBM 短期预测）"""
+"""trainer.py — 模型训练器（LightGBM 短期预测 + 版本回滚 + 特征重要性）"""
 import os
 import json
 import pickle
@@ -13,6 +13,7 @@ from sklearn.model_selection import train_test_split
 from src.core.config import get_model_config
 
 EXCLUDE_COLS = {"dt", "province", "type", "price"}
+MAX_VERSIONS = 3  # 每个 province/type 保留最近 3 个版本
 
 
 class Trainer:
@@ -23,14 +24,12 @@ class Trainer:
     def prepare_training_data(self, df: pd.DataFrame,
                                target_col: str = "value") -> Tuple[pd.DataFrame, pd.Series]:
         df = df.dropna(subset=[target_col]).copy()
-
         feature_cols = [
             c for c in df.columns
             if c not in EXCLUDE_COLS and c != target_col
         ]
         X = df[feature_cols].select_dtypes(include=[np.number])
         y = df[target_col]
-
         return X, y
 
     def train(self, df: pd.DataFrame, province: str,
@@ -77,7 +76,9 @@ class Trainer:
             pickle.dump(model, f)
 
         self._update_registry(province, target_type, model_filename,
-                              list(X.columns))
+                              list(X.columns), model_path)
+
+        self._cleanup_old_versions(province, target_type)
 
         return {
             "province": province,
@@ -92,21 +93,15 @@ class Trainer:
                     target_type: str, target_col: str = "value",
                     params: Dict = None) -> Dict:
         X, y = self.prepare_training_data(df, target_col)
-
         lgb_params = {
-            "objective": "regression",
-            "metric": "rmse",
-            "num_leaves": 31,
-            "learning_rate": 0.1,
-            "verbose": -1,
-            "n_estimators": 100,
+            "objective": "regression", "metric": "rmse",
+            "num_leaves": 31, "learning_rate": 0.1,
+            "verbose": -1, "n_estimators": 100,
         }
         if params:
             lgb_params.update(params)
-
         model = lgb.LGBMRegressor(**lgb_params)
         model.fit(X, y)
-
         return {
             "model": model,
             "feature_names": list(X.columns),
@@ -116,13 +111,21 @@ class Trainer:
         }
 
     def load_model(self, province: str,
-                   target_type: str) -> Tuple[lgb.LGBMRegressor, List[str]]:
+                   target_type: str,
+                   version: int = -1) -> Tuple[lgb.LGBMRegressor, List[str], str]:
+        """加载模型. version: -1=最新, 0=上一个, 1=上上个..."""
         registry = self._read_registry()
         key = f"{province}_{target_type}"
         if key not in registry:
             raise FileNotFoundError(f"未找到模型: {key}")
 
-        model_filename = registry[key]["latest"]
+        entry = registry[key]
+        versions = entry.get("versions", [entry.get("latest", "")])
+        if not versions:
+            raise FileNotFoundError(f"未找到模型版本: {key}")
+
+        idx = version if version == -1 else min(version, len(versions) - 1)
+        model_filename = versions[-(idx if idx == -1 else idx + 1)]
         model_path = os.path.join(self.model_dir, province, model_filename)
 
         if not os.path.exists(model_path):
@@ -131,20 +134,121 @@ class Trainer:
         with open(model_path, "rb") as f:
             model = pickle.load(f)
 
-        return model, registry[key]["feature_names"]
+        return model, entry["feature_names"], model_filename
 
-    def _update_registry(self, province: str, target_type: str,
-                         filename: str, feature_names: List[str]):
+    # ── 版本回滚 ──
+
+    def rollback(self, province: str, target_type: str) -> Dict:
+        """回滚到上一个版本."""
         registry = self._read_registry()
         key = f"{province}_{target_type}"
+        if key not in registry:
+            return {"error": f"未找到模型: {key}"}
+
+        versions = registry[key].get("versions", [])
+        if len(versions) < 2:
+            return {"error": "只有一个版本，无法回滚"}
+
+        old = versions.pop()
+        registry[key]["versions"] = versions
+
+        registry_path = os.path.join(self.model_dir, "model_registry.json")
+        with open(registry_path, "w") as f:
+            json.dump(registry, f, indent=2, ensure_ascii=False)
+
+        # 删除废弃的模型文件
+        old_path = os.path.join(self.model_dir, province, old)
+        if os.path.exists(old_path):
+            os.remove(old_path)
+
+        return {
+            "status": "rolled_back",
+            "removed_version": old,
+            "current_version": versions[-1],
+            "remaining_versions": len(versions),
+        }
+
+    def list_versions(self, province: str, target_type: str) -> List[Dict]:
+        """列出所有版本."""
+        registry = self._read_registry()
+        key = f"{province}_{target_type}"
+        if key not in registry:
+            return []
+
+        entry = registry[key]
+        versions = entry.get("versions", [])
+        result = []
+        for i, v in enumerate(reversed(versions)):
+            info = {"version": i, "filename": v}
+            vpath = os.path.join(self.model_dir, province, v)
+            if os.path.exists(vpath):
+                info["size_kb"] = round(os.path.getsize(vpath) / 1024, 1)
+            result.append(info)
+
+        return result
+
+    # ── 特征重要性 ──
+
+    def feature_importance(self, province: str,
+                           target_type: str) -> List[Dict]:
+        """返回 Top 特征重要性.
+
+        Returns: [{rank, feature, importance, pct}, ...]
+        """
+        model, feature_names, _ = self.load_model(province, target_type)
+        importances = model.feature_importances_
+
+        pairs = sorted(
+            zip(feature_names, importances),
+            key=lambda x: x[1], reverse=True
+        )
+
+        total = sum(importances) or 1
+        result = []
+        for i, (name, imp) in enumerate(pairs):
+            result.append({
+                "rank": i + 1,
+                "feature": name,
+                "importance": round(float(imp), 6),
+                "pct": round(float(imp / total * 100), 1),
+            })
+
+        return result
+
+    # ── 注册表管理 ──
+
+    def _update_registry(self, province: str, target_type: str,
+                         filename: str, feature_names: List[str],
+                         model_path: str):
+        registry = self._read_registry()
+        key = f"{province}_{target_type}"
+
+        old_versions = registry.get(key, {}).get("versions", [])
+
         registry[key] = {
-            "latest": filename,
+            "versions": (old_versions + [filename])[-MAX_VERSIONS:],
             "feature_names": feature_names,
             "updated_at": datetime.now().isoformat(),
         }
         registry_path = os.path.join(self.model_dir, "model_registry.json")
         with open(registry_path, "w") as f:
             json.dump(registry, f, indent=2, ensure_ascii=False)
+
+    def _cleanup_old_versions(self, province: str, target_type: str):
+        """删除超出 MAX_VERSIONS 的旧模型文件."""
+        registry = self._read_registry()
+        key = f"{province}_{target_type}"
+        versions = registry.get(key, {}).get("versions", [])
+
+        province_dir = os.path.join(self.model_dir, province)
+        if not os.path.exists(province_dir):
+            return
+
+        for fname in os.listdir(province_dir):
+            if fname.startswith(f"{province}_{target_type}") and fname.endswith(".lgb"):
+                if fname not in versions:
+                    old_path = os.path.join(province_dir, fname)
+                    os.remove(old_path)
 
     def _read_registry(self) -> Dict:
         registry_path = os.path.join(self.model_dir, "model_registry.json")

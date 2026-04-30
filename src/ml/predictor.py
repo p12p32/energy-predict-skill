@@ -7,7 +7,6 @@ from typing import List, Optional, Tuple
 from src.ml.trainer import Trainer
 from src.ml.trend import TrendModel
 from src.data.features import FeatureStore
-from src.core.db import DorisDB
 from src.data.fetcher import DataFetcher
 from src.core.config import load_config
 
@@ -16,13 +15,13 @@ class Predictor:
     def __init__(self, trainer: Trainer = None,
                  store: FeatureStore = None):
         self.trainer = trainer or Trainer()
-        self.store = store or FeatureStore(DorisDB())
+        self.store = store or FeatureStore()
         self.fetcher = DataFetcher()
 
     def predict(self, province: str, target_type: str,
                 horizon_hours: int = 24,
                 model_version: str = None) -> pd.DataFrame:
-        model, feature_names = self.trainer.load_model(province, target_type)
+        model, feature_names, _ = self.trainer.load_model(province, target_type)
         horizon_steps = min(horizon_hours * 4, 96)
 
         lookback_days = 14

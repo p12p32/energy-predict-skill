@@ -1,9 +1,7 @@
-"""feature_store.py — 特征工程与 Doris 特征表管理"""
+"""feature_store.py — 特征工程与数据源抽象管理"""
 import pandas as pd
 import numpy as np
 from typing import Optional, List
-from src.core.db import DorisDB
-from src.core.config import load_config
 from src.data.holidays import add_holiday_features, add_cyclical_features
 from src.data.quality import DataQuality
 
@@ -146,13 +144,16 @@ class FeatureEngineer:
 
 
 class FeatureStore:
-    def __init__(self, db: DorisDB):
-        self.db = db
+    """特征存储管理. 通过 DataSource 抽象, 不依赖特定数据库."""
 
-    def ensure_tables(self):
-        self.db.execute(FEATURE_TABLE_DDL)
-        self.db.execute(PREDICTION_TABLE_DDL)
-        self.db.execute(STRATEGY_TABLE_DDL)
+    def __init__(self, source=None):
+        if source is None:
+            from src.core.data_source import FileSource
+            source = FileSource()
+        self.source = source
+
+    def setup(self):
+        self.source.setup()
 
     def insert_features(self, df: pd.DataFrame) -> int:
         cols = [
@@ -171,9 +172,7 @@ class FeatureStore:
             "quality_flag",
         ]
         available = [c for c in cols if c in df.columns]
-        return self.db.insert_dataframe(
-            df[available], "energy_feature_store"
-        )
+        return self.source.save_features(df[available])
 
     def insert_predictions(self, df: pd.DataFrame) -> int:
         cols = ["dt", "province", "type", "p10", "p50", "p90",
@@ -181,33 +180,16 @@ class FeatureStore:
         available = [c for c in cols if c in df.columns]
         if "model_version" not in df.columns:
             df["model_version"] = "v1"
-        return self.db.insert_dataframe(
-            df[available], "energy_predictions"
-        )
+        return self.source.save_predictions(df[available])
 
     def load_features(self, province: str, data_type: str,
                       start_date: str, end_date: str) -> pd.DataFrame:
-        sql = f"""
-            SELECT * FROM energy_feature_store
-            WHERE province = '{province}'
-              AND type = '{data_type}'
-              AND dt >= '{start_date}'
-              AND dt < '{end_date}'
-            ORDER BY dt
-        """
-        return self.db.query(sql)
+        return self.source.load_features(province, data_type, start_date, end_date)
 
     def load_raw_data(self, province: str, data_type: str,
                       start_date: str, end_date: str) -> pd.DataFrame:
-        cfg = load_config()
-        src_table = cfg["data"]["source_table"]
-        sql = f"""
-            SELECT dt, province, type, value, price
-            FROM {src_table}
-            WHERE province = '{province}'
-              AND type = '{data_type}'
-              AND dt >= '{start_date}'
-              AND dt < '{end_date}'
-            ORDER BY dt
-        """
-        return self.db.query(sql)
+        return self.source.load_raw(province, data_type, start_date, end_date)
+
+    def load_predictions(self, province: str, data_type: str,
+                         start_date: str, end_date: str) -> pd.DataFrame:
+        return self.source.load_predictions(province, data_type, start_date, end_date)

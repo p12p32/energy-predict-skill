@@ -6,7 +6,7 @@ import pandas as pd
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
-from src.core.db import DorisDB
+from src.core.data_source import DataSource, FileSource
 from src.ml.trainer import Trainer
 from src.evolve.backtester import Backtester
 from src.ml.executor import StrategyExecutor
@@ -81,10 +81,10 @@ class Improver:
     # 成功率低于此值则惩罚
     LOW_SUCCESS_THRESHOLD = 0.3
 
-    def __init__(self, db: DorisDB = None,
+    def __init__(self, data_source: DataSource = None,
                  trainer: Trainer = None,
                  backtester: Backtester = None):
-        self.db = db or DorisDB()
+        self.source = data_source or FileSource()
         self.trainer = trainer or Trainer()
         self.backtester = backtester or Backtester(self.trainer)
         self.executor = StrategyExecutor()
@@ -178,28 +178,19 @@ class Improver:
         return unique[:12]
 
     def _get_knowledge_map(self, _keywords: set) -> Dict[str, Dict]:
-        """从知识库加载所有策略的历史表现."""
-        if not self.db.table_exists("strategy_knowledge"):
+        df = self.source.load_knowledge()
+        if df.empty:
             return {}
-
-        sql = """
-            SELECT strategy_hash, applied_count, success_count,
-                   avg_improvement, best_scenario, retired, last_effect
-            FROM strategy_knowledge
-        """
-        try:
-            df = self.db.query(sql)
-            result = {}
-            for _, row in df.iterrows():
-                result[row["strategy_hash"]] = {
-                    "applied_count": int(row["applied_count"]),
-                    "success_count": int(row["success_count"]),
-                    "avg_improvement": float(row["avg_improvement"]),
-                    "retired": bool(row["retired"]),
-                }
-            return result
-        except Exception:
-            return {}
+        result = {}
+        for _, row in df.iterrows():
+            key = row.get("strategy_hash", row.get("name", ""))
+            result[str(key)] = {
+                "applied_count": int(row.get("applied_count", 0)),
+                "success_count": int(row.get("success_count", 0)),
+                "avg_improvement": float(row.get("avg_improvement", 0)),
+                "retired": bool(row.get("retired", False)),
+            }
+        return result
 
     def _calc_knowledge_score(self, k_info: Dict) -> float:
         """基于历史数据计算策略的推荐分数.
@@ -416,9 +407,11 @@ class Improver:
 
     def record_strategy(self, strategy: Dict, scenario: str = "",
                         success: bool = True):
-        """记录策略到知识库."""
         strategy_hash = self._hash(strategy.get("name", ""))
         desc = strategy.get("desc", strategy.get("name", ""))
+
+        df = self.source.load_knowledge()
+        existing = df[df["strategy_hash"] == strategy_hash] if not df.empty and "strategy_hash" in df.columns else pd.DataFrame()
 
         improvement = strategy.get("improvement", {})
         if isinstance(improvement, dict):
@@ -426,52 +419,42 @@ class Improver:
         else:
             effect = float(improvement) if improvement else 0
 
-        sql = f"""
-            INSERT INTO strategy_knowledge
-                (strategy_hash, strategy_desc, applied_count, success_count,
-                 avg_improvement, best_scenario, worst_scenario,
-                 last_applied, last_effect)
-            VALUES
-                ('{strategy_hash}', '{desc}', 1, {1 if success else 0},
-                 {abs(effect)}, '{scenario}', '',
-                 '{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}', {effect})
-            ON DUPLICATE KEY UPDATE
-                applied_count = applied_count + 1,
-                success_count = success_count + {1 if success else 0},
-                avg_improvement = (avg_improvement * applied_count + {abs(effect)})
-                                  / (applied_count + 1),
-                last_applied = '{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
-                last_effect = {effect}
-        """
-        self.db.execute(sql)
+        if not existing.empty:
+            prev = existing.iloc[0]
+            applied = int(prev.get("applied_count", 0)) + 1
+            success_count = int(prev.get("success_count", 0)) + (1 if success else 0)
+            avg_imp = (float(prev.get("avg_improvement", 0)) * (applied - 1) + abs(effect)) / applied
+        else:
+            applied = 1
+            success_count = 1 if success else 0
+            avg_imp = abs(effect)
+
+        self.source.save_knowledge({
+            "strategy_hash": strategy_hash,
+            "strategy_desc": desc,
+            "applied_count": applied,
+            "success_count": success_count,
+            "avg_improvement": avg_imp,
+            "best_scenario": scenario,
+            "last_effect": effect,
+            "retired": False,
+        })
 
     def _retire_strategy(self, strategy_sig: str):
-        """退役一个策略."""
-        try:
-            self.db.execute(
-                f"UPDATE strategy_knowledge SET retired = TRUE "
-                f"WHERE strategy_hash = '{strategy_sig}'"
-            )
-        except Exception:
-            pass
+        df = self.source.load_knowledge()
+        if df.empty or "strategy_hash" not in df.columns:
+            return
+        df.loc[df["strategy_hash"] == strategy_sig, "retired"] = True
+        for _, row in df.iterrows():
+            self.source.save_knowledge(row.to_dict())
 
     def query_knowledge(self, scenario: str) -> List[Dict]:
-        """查询知识库."""
-        sql = f"""
-            SELECT strategy_hash, strategy_desc, applied_count,
-                   success_count, avg_improvement, best_scenario,
-                   last_applied, last_effect
-            FROM strategy_knowledge
-            WHERE NOT retired
-              AND (best_scenario LIKE '%{scenario}%' OR best_scenario = '')
-            ORDER BY avg_improvement DESC
-            LIMIT 20
-        """
-        return (
-            self.db.query(sql).to_dict("records")
-            if self.db.table_exists("strategy_knowledge")
-            else []
-        )
+        df = self.source.load_knowledge()
+        if df.empty:
+            return []
+        if "retired" in df.columns:
+            df = df[~df["retired"]]
+        return df.head(20).to_dict("records")
 
     # ================================================================
     #  完整一轮优化

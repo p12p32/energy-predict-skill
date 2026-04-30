@@ -169,6 +169,101 @@ python3 src/daemon.py --once
 
 ---
 
+### /import <文件路径>
+
+导入 CSV 数据（无需数据库）:
+
+```bash
+python3 -c "
+from src.core.data_source import FileSource
+fs = FileSource()
+fs.import_csv('data/guangdong.csv')
+print('导入完成')
+"
+```
+
+CSV 必须包含列: `dt`(时间戳), `province`(省份), `type`(output/load/price), `value`, `price`(可选)
+
+---
+
+### /validate <省份> <类型>
+
+数据校验:
+
+```bash
+python3 -c "
+from src.orchestrator import Orchestrator
+import json
+o = Orchestrator()
+result = o.validate_data('广东', 'load')
+print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+"
+```
+
+---
+
+### /explain <省份> <类型>
+
+查看特征重要性:
+
+```bash
+python3 -c "
+from src.orchestrator import Orchestrator
+import json
+o = Orchestrator()
+result = o.explain('广东', 'load')
+for f in result['feature_importance'][:10]:
+    print(f\"  #{f['rank']:2d} {f['feature']:<30s} {f['pct']:5.1f}%\")
+print(f\"版本数: {len(result.get('model_versions',[]))}\")
+"
+```
+
+---
+
+### /rollback <省份> <类型>
+
+回滚到上版本:
+
+```bash
+python3 -c "
+from src.orchestrator import Orchestrator
+o = Orchestrator()
+result = o.rollback_model('广东', 'load')
+print(result)
+"
+```
+
+---
+
+### /export <省份> <类型> [格式]
+
+导出预测(默认 json):
+
+```bash
+python3 -c "
+from src.orchestrator import Orchestrator
+o = Orchestrator()
+result = o.export('广东', 'load', fmt='csv')
+print(result)
+"
+```
+
+---
+
+### /chart <省份> <类型> [小时]
+
+ASCII 折线图:
+
+```bash
+python3 -c "
+from src.orchestrator import Orchestrator
+o = Orchestrator()
+print(o.chart('广东', 'load', 24))
+"
+```
+
+---
+
 ## 错误处理
 
 | 错误 | 处理 |

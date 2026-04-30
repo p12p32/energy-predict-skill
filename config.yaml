@@ -1,4 +1,6 @@
 # config.yaml — 全局配置
+data_source: "file"               # file(零依赖) | memory(临时) | doris(生产)
+
 doris:
   host: "127.0.0.1"
   port: 9030

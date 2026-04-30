@@ -3,8 +3,8 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
-from src.core.db import DorisDB
 from src.core.config import get_provinces, get_types
+from src.core.data_source import FileSource
 from src.data.features import FeatureStore, FeatureEngineer
 from src.data.fetcher import DataFetcher
 from src.ml.trainer import Trainer
@@ -21,14 +21,14 @@ logger = logging.getLogger(__name__)
 
 class Orchestrator:
     def __init__(self):
-        self.db = DorisDB()
-        self.store = FeatureStore(self.db)
+        self.source = FileSource()
+        self.store = FeatureStore(self.source)
         self.trainer = Trainer()
         self.backtester = Backtester(self.trainer)
         self.predictor = Predictor(self.trainer, self.store)
         self.validator = Validator()
         self.analyzer = Analyzer()
-        self.improver = Improver(self.db, self.trainer, self.backtester)
+        self.improver = Improver(self.source, self.trainer, self.backtester)
         self.fetcher = DataFetcher()
         self.engineer = FeatureEngineer()
 
@@ -36,8 +36,8 @@ class Orchestrator:
 
     def setup(self):
         logger.info("初始化系统...")
-        self.store.ensure_tables()
-        logger.info("表结构已就绪")
+        self.source.setup()
+        logger.info("数据存储已就绪")
 
     def build_features(self, province: str = None,
                        start_date: str = None,
@@ -88,10 +88,10 @@ class Orchestrator:
         end = datetime.now()
         start = end - timedelta(hours=48)
 
-        predictions = self.db.query(
-            f"SELECT * FROM energy_predictions "
-            f"WHERE province='{province}' AND type='{target_type}' "
-            f"AND dt >= '{start.strftime('%Y-%m-%d %H:%M:%S')}'"
+        predictions = self.store.load_predictions(
+            province, target_type,
+            start.strftime("%Y-%m-%d"),
+            (end + timedelta(days=1)).strftime("%Y-%m-%d"),
         )
 
         actuals = self.store.load_raw_data(
@@ -258,3 +258,114 @@ class Orchestrator:
                     f"  完成: n={result['n_samples']}, "
                     f"features={result['n_features']}"
                 )
+
+    # ── Tier 2 新增方法 ──
+
+    def validate_data(self, province: str, target_type: str) -> Dict:
+        """数据校验: 检查缺失率、时间连续性、类型正确性."""
+        end = datetime.now()
+        start = end - timedelta(days=365)
+        df = self.store.load_raw_data(province, target_type,
+                                       start.strftime("%Y-%m-%d"),
+                                       (end + timedelta(days=1)).strftime("%Y-%m-%d"))
+        if df.empty:
+            return {"error": "no_data"}
+
+        issues = []
+        total = len(df)
+
+        # 缺失率
+        null_rate = df["value"].isna().mean() if "value" in df.columns else 0
+        if null_rate > 0:
+            issues.append(f"缺失率: {null_rate:.2%}")
+
+        # 时间连续性 (15分钟粒度，最大间隔应<30分钟)
+        if "dt" in df.columns:
+            gaps = df["dt"].diff().dropna()
+            large_gaps = gaps[gaps > pd.Timedelta(minutes=30)]
+            if len(large_gaps) > 0:
+                issues.append(f"时间间隙>30min: {len(large_gaps)}处, 最大{gaps.max()}")
+
+        # 零值/负值
+        if "value" in df.columns:
+            neg_rate = (df["value"] <= 0).mean()
+            if neg_rate > 0:
+                issues.append(f"零值/负值比例: {neg_rate:.2%}")
+
+        return {
+            "province": province,
+            "type": target_type,
+            "total_rows": total,
+            "date_range": f"{df['dt'].min()} ~ {df['dt'].max()}",
+            "null_rate": round(null_rate, 4),
+            "issues": issues,
+            "status": "ok" if not issues else "has_issues",
+        }
+
+    def explain(self, province: str, target_type: str) -> Dict:
+        """特征重要性分析."""
+        importance = self.trainer.feature_importance(province, target_type)
+        versions = self.trainer.list_versions(province, target_type)
+        return {
+            "province": province,
+            "type": target_type,
+            "feature_importance": importance[:15],
+            "model_versions": versions,
+        }
+
+    def export(self, province: str, target_type: str,
+               fmt: str = "json", output: str = None) -> str:
+        """导出预测结果为 JSON 或 CSV."""
+        end = datetime.now()
+        start = end - timedelta(hours=48)
+        df = self.store.load_predictions(province, target_type,
+                                          start.strftime("%Y-%m-%d"),
+                                          (end + timedelta(days=1)).strftime("%Y-%m-%d"))
+        if df.empty:
+            return "无预测数据"
+
+        if output is None:
+            output = f"{province}_{target_type}_predictions.{fmt}"
+
+        if fmt == "csv":
+            df.to_csv(output, index=False)
+        else:
+            df.to_json(output, orient="records", force_ascii=False, indent=2)
+
+        return f"已导出 {len(df)} 条记录到 {output}"
+
+    def rollback_model(self, province: str, target_type: str) -> Dict:
+        """回滚模型到上一个版本."""
+        return self.trainer.rollback(province, target_type)
+
+    def chart(self, province: str, target_type: str,
+              hours: int = 24) -> str:
+        """生成终端 ASCII 折线图."""
+        import math
+
+        result = self.predict(province, target_type, hours)
+        samples = result.get("sample", [])
+        if not samples:
+            return "无预测数据"
+
+        values = [s["p50"] for s in samples]
+        vmin, vmax = min(values), max(values)
+        height, width = 12, 60
+
+        if vmax == vmin:
+            return "所有预测值相同，无法绘图"
+
+        chart = f"\n  {province} {target_type} 预测 ({hours}h)\n"
+        chart += f"  {'─' * (width + 8)}\n"
+
+        for row in range(height - 1, -1, -1):
+            line = ""
+            for col in range(min(len(values), width)):
+                val = values[col]
+                y = int((val - vmin) / (vmax - vmin) * (height - 1))
+                line += "█" if y >= row else " "
+            val_label = vmin + (vmax - vmin) * row / (height - 1)
+            chart += f"  {val_label:>10,.0f} │{line}\n"
+
+        chart += f"  {'─' * (width + 12)}\n"
+        return chart
