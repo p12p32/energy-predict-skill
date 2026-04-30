@@ -158,46 +158,80 @@ class Orchestrator:
     def _run_improvement_cycle(self, province: str,
                                 target_type: str,
                                 validation_report: Dict) -> Dict:
+        """循环 C: improver → trainer 实验 → backtester 裁决.
+
+        修复数据泄漏: 回测和实验使用独立时间窗口。
+        - 回测窗口 (60~20 天前): 建立基线
+        - 实验窗口 (20~0 天前): improver 实验
+        """
         end = datetime.now()
-        start = end - timedelta(days=60)
-        df = self.store.load_features(
+        bt_start = end - timedelta(days=60)
+        bt_end = end - timedelta(days=20)
+        exp_start = bt_end
+        exp_end = end
+
+        # ── 回测窗口：建立基线 ──
+        bt_df = self.store.load_features(
             province, target_type,
-            start.strftime("%Y-%m-%d"),
-            (end + timedelta(days=1)).strftime("%Y-%m-%d"),
+            bt_start.strftime("%Y-%m-%d"),
+            (bt_end + timedelta(days=1)).strftime("%Y-%m-%d"),
         )
 
-        if df.empty:
+        if bt_df.empty:
             return {"status": "no_data"}
 
         bt_result = self.backtester.evaluate_model(
-            df, train_window_days=14, test_window_hours=24,
+            bt_df, train_window_days=14, test_window_hours=24,
             province=province, target_type=target_type,
         )
 
         diagnosis = self.analyzer.diagnose(bt_result)
 
+        # ── 实验窗口：improver 在独立数据上实验 ──
+        exp_df = self.store.load_features(
+            province, target_type,
+            exp_start.strftime("%Y-%m-%d"),
+            (exp_end + timedelta(days=1)).strftime("%Y-%m-%d"),
+        )
+
+        if exp_df.empty:
+            return {
+                "status": "backtest_only",
+                "mape": bt_result.get("overall_mape"),
+                "diagnoses": diagnosis,
+            }
+
+        baseline_mape = bt_result.get("overall_mape", 0.10)
         improvement = self.improver.improve(
-            diagnosis, df, province, target_type,
-            baseline={"overall_mape": bt_result.get("overall_mape", 0.10)},
+            diagnosis, exp_df, province, target_type,
+            baseline={"overall_mape": baseline_mape},
         )
 
         logger.info(
             f"优化 {province}/{target_type}: "
             f"策略={improvement.get('selected_strategy')}, "
-            f"MAPE {improvement.get('mape_before')} → "
-            f"{improvement.get('mape_after')}"
+            f"基线MAPE={baseline_mape}, "
+            f"实验后MAPE={improvement.get('mape_after')}"
         )
 
+        # ── 改善显著 → 全量重训练 ──
         if improvement.get("improvement", 0) > 0.03:
             logger.info("触发全量重训练...")
-            self.trainer.train(
-                df, province, target_type,
-                target_col="value",
+            full_df = self.store.load_features(
+                province, target_type,
+                (end - timedelta(days=90)).strftime("%Y-%m-%d"),
+                (end + timedelta(days=1)).strftime("%Y-%m-%d"),
             )
+            if not full_df.empty:
+                self.trainer.train(
+                    full_df, province, target_type,
+                    target_col="value",
+                )
 
         return {
             "status": "improved",
             "validation": validation_report,
+            "baseline_mape": baseline_mape,
             "improvement": improvement,
             "diagnoses": diagnosis,
         }

@@ -1,20 +1,22 @@
-"""improver.py — 学习型优化引擎 + 策略知识库"""
+"""improver.py — 学习型优化引擎 + 策略知识库（闭环版）"""
 import json
 import hashlib
 import numpy as np
+import pandas as pd
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
 from src.db import DorisDB
 from src.trainer import Trainer
 from src.backtester import Backtester
+from src.strategy_executor import StrategyExecutor
 
 
 class Improver:
     SEED_STRATEGIES = [
         {
             "name": "polynomial_features",
-            "description": "加入多项式特征 {col}²",
+            "description": "加入多项式特征（temperature²等）",
             "params": {"power": 2},
             "applicable": ["nonlinear"],
         },
@@ -62,7 +64,7 @@ class Improver:
         },
         {
             "name": "rolling_window_features",
-            "description": "{col} 滑动窗口均值({n}h) 作为新特征",
+            "description": "关键指标滑动窗口均值作为新特征",
             "params": {"window_hours": 4},
             "applicable": ["smoothness"],
         },
@@ -74,14 +76,32 @@ class Improver:
         },
     ]
 
+    # 连续失败 N 次则退役
+    RETIRE_AFTER_FAILURES = 5
+    # 成功率低于此值则惩罚
+    LOW_SUCCESS_THRESHOLD = 0.3
+
     def __init__(self, db: DorisDB = None,
                  trainer: Trainer = None,
                  backtester: Backtester = None):
         self.db = db or DorisDB()
         self.trainer = trainer or Trainer()
         self.backtester = backtester or Backtester(self.trainer)
+        self.executor = StrategyExecutor()
+
+    # ================================================================
+    #  假设生成（已集成知识库过滤）
+    # ================================================================
 
     def generate_hypotheses(self, diagnosis: List[Dict]) -> List[Dict]:
+        """基于诊断 + 历史知识库生成假设池.
+
+        三步:
+        1. 关键词匹配种子策略
+        2. 查知识库 → 读过失败的、加权成功的
+        3. 排序输出
+        """
+        # ── 提取关键词 ──
         keywords = set()
         for d in diagnosis:
             root = d.get("root_cause", "")
@@ -95,32 +115,56 @@ class Improver:
             for sf in d.get("suggested_features", []):
                 suggested.add(sf.lower())
 
-        hypotheses = []
+        # ── 匹配 + 知识库加权 ──
+        knowledge = self._get_knowledge_map(keywords)
 
+        hypotheses = []
         for seed in self.SEED_STRATEGIES:
             applicable = seed.get("applicable", [])
-            if any(kw in applicable for kw in keywords):
-                hypotheses.append({
-                    "name": seed["name"],
-                    "description": seed["description"],
-                    "params": dict(seed.get("params", {})),
-                    "source": "seed_match",
-                })
-            elif suggested & set(applicable):
-                hypotheses.append({
-                    "name": seed["name"],
-                    "description": seed["description"],
-                    "params": dict(seed.get("params", {})),
-                    "source": "suggested_match",
-                })
-            elif "overall" in keywords or "critical" in keywords:
-                hypotheses.append({
-                    "name": seed["name"],
-                    "description": seed["description"],
-                    "params": dict(seed.get("params", {})),
-                    "source": "critical_explore",
-                })
 
+            # 判定是否匹配
+            matched = False
+            source = ""
+            if any(kw in applicable for kw in keywords):
+                matched = True
+                source = "seed_match"
+            elif suggested & set(applicable):
+                matched = True
+                source = "suggested_match"
+            elif "overall" in keywords or "critical" in keywords:
+                matched = True
+                source = "critical_explore"
+
+            if not matched:
+                continue
+
+            # 检查知识库
+            sig = seed["name"] + json.dumps(seed.get("params", {}), sort_keys=True)
+            k_info = knowledge.get(sig, {})
+
+            # 退役检查
+            if k_info.get("retired"):
+                continue
+
+            # 连续失败过多 → 跳过
+            if (k_info.get("applied_count", 0) - k_info.get("success_count", 0)
+                    >= self.RETIRE_AFTER_FAILURES):
+                self._retire_strategy(sig)
+                continue
+
+            # 计算知识库加权分数
+            knowledge_score = self._calc_knowledge_score(k_info)
+
+            hypotheses.append({
+                "name": seed["name"],
+                "description": seed["description"],
+                "params": dict(seed.get("params", {})),
+                "source": source,
+                "knowledge_score": knowledge_score,
+                "knowledge_info": k_info,
+            })
+
+        # 去重
         seen = set()
         unique = []
         for h in hypotheses:
@@ -129,26 +173,87 @@ class Improver:
                 seen.add(sig)
                 unique.append(h)
 
+        # 按知识库分数排序（分数高的优先），取前 12
+        unique.sort(key=lambda h: h["knowledge_score"], reverse=True)
         return unique[:12]
+
+    def _get_knowledge_map(self, _keywords: set) -> Dict[str, Dict]:
+        """从知识库加载所有策略的历史表现."""
+        if not self.db.table_exists("strategy_knowledge"):
+            return {}
+
+        sql = """
+            SELECT strategy_hash, applied_count, success_count,
+                   avg_improvement, best_scenario, retired, last_effect
+            FROM strategy_knowledge
+        """
+        try:
+            df = self.db.query(sql)
+            result = {}
+            for _, row in df.iterrows():
+                result[row["strategy_hash"]] = {
+                    "applied_count": int(row["applied_count"]),
+                    "success_count": int(row["success_count"]),
+                    "avg_improvement": float(row["avg_improvement"]),
+                    "retired": bool(row["retired"]),
+                }
+            return result
+        except Exception:
+            return {}
+
+    def _calc_knowledge_score(self, k_info: Dict) -> float:
+        """基于历史数据计算策略的推荐分数.
+
+        新策略(从未用过): 基础分 0.5（中性）
+        成功过的策略: 基础分 + 成功率加成 + 改进幅度加成
+        失败过的策略: 惩罚
+        """
+        applied = k_info.get("applied_count", 0)
+        if applied == 0:
+            return 0.5  # 新策略，中性分
+
+        success = k_info.get("success_count", 0)
+        rate = success / applied
+        avg_imp = k_info.get("avg_improvement", 0)
+
+        score = 0.6  # 基础分
+        score += rate * 0.3  # 成功率贡献（最多 +0.3）
+        score += min(avg_imp, 0.1)  # 改进幅度贡献（最多 +0.1）
+
+        # 低成功率惩罚
+        if applied >= 3 and rate < self.LOW_SUCCESS_THRESHOLD:
+            score -= 0.4
+
+        return max(0.0, min(1.0, score))
+
+    # ================================================================
+    #  实验执行（集成 StrategyExecutor）
+    # ================================================================
 
     def run_experiment(self, hypothesis: Dict, df: pd.DataFrame,
                        province: str, target_type: str,
                        target_col: str = "value") -> Dict:
+        """执行单个假设的实验：数据变换 → 快速训练 → 回测打分."""
         try:
-            bt_result = self.trainer.quick_train(
-                df, province, target_type, target_col,
-                params=hypothesis.get("model_params"),
-            )
+            # ── 1. 数据变换 ──
+            transformed = self.executor.execute(df.copy(), hypothesis)
 
-            total = len(df)
+            # ── 2. 快速训练（数据级变换影响所有数据，特征级变换只影响训练数据）──
+            model_params = self._extract_model_params(hypothesis)
+
+            total = len(transformed)
             test_steps = min(96, total // 5)
-            train_df = df.iloc[:-test_steps]
-            test_df = df.iloc[-test_steps:]
+            train_df = transformed.iloc[:-test_steps]
+            test_df = transformed.iloc[-test_steps:]
 
-            model = bt_result["model"]
-            pred = model.predict(
-                test_df[bt_result["feature_names"]].values
+            bt_result = self.trainer.quick_train(
+                train_df, province, target_type, target_col,
+                params=model_params,
             )
+
+            # ── 3. 预测评估 ──
+            test_features = test_df[bt_result["feature_names"]].values
+            pred = bt_result["model"].predict(test_features)
             actual = test_df[target_col].values
 
             mask = actual != 0
@@ -161,7 +266,8 @@ class Improver:
                 "hypothesis_id": self._hash(hypothesis["name"]),
                 "hypothesis": hypothesis,
                 "mape": round(mape, 4),
-                "n_samples": len(df),
+                "n_train": len(train_df),
+                "n_test": len(test_df),
             }
         except Exception as e:
             return {
@@ -170,9 +276,25 @@ class Improver:
                 "error": str(e),
             }
 
+    def _extract_model_params(self, hypothesis: Dict) -> Dict:
+        """从假设中提取模型参数（仅模型级策略有）."""
+        name = hypothesis.get("name", "")
+        params = hypothesis.get("params", {})
+
+        if name == "switch_to_catboost":
+            # CatBoost 的等效参数（实际不会生效在 LightGBM，但标记意图）
+            return {"boosting_type": "ordered"}
+
+        return {}
+
+    # ================================================================
+    #  竞技场与选择
+    # ================================================================
+
     def run_arena(self, hypotheses: List[Dict], df: pd.DataFrame,
                   province: str, target_type: str,
                   target_col: str = "value") -> List[Dict]:
+        """竞技场: 测试 N 个假设，返回排序后的结果."""
         results = []
         for h in hypotheses:
             result = self.run_experiment(h, df, province, target_type, target_col)
@@ -183,6 +305,10 @@ class Improver:
     def select_best(self, arena_results: List[Dict],
                      diagnosis: List[Dict],
                      baseline: Dict) -> Dict:
+        """从竞技场选择最优策略.
+
+        评分 = 主问题 MAPE 降幅 × 严重性权重 − 复杂度罚分 − 知识库罚分
+        """
         if not arena_results:
             return {"error": "no_valid_experiments"}
 
@@ -203,17 +329,18 @@ class Improver:
 
             improvement = baseline_mape - mape
 
-            complexity_penalty = 0.0
-            if "polynomial" in r.get("hypothesis", {}).get("name", ""):
-                complexity_penalty = 0.002
-            if "catboost" in r.get("hypothesis", {}).get("name", "").lower():
-                complexity_penalty = 0.004
+            # 复杂度罚分
+            complexity_penalty = self._calc_complexity_penalty(r)
 
+            # 历史罚分
+            history_penalty = self._calc_history_penalty(r)
+
+            # 问题权重
             weight = 1.0
             for scenario, severity in pain_points.items():
                 weight = max(weight, severity_weight.get(severity, 1.0))
 
-            score = improvement * weight - complexity_penalty
+            score = improvement * weight - complexity_penalty - history_penalty
 
             scored.append({
                 **r,
@@ -236,8 +363,35 @@ class Improver:
             "all_results": [s["hypothesis_id"] for s in scored[:5]],
         }
 
+    def _calc_complexity_penalty(self, result: Dict) -> float:
+        h = result.get("hypothesis", {})
+        name = h.get("name", "")
+        penalties = {
+            "polynomial_features": 0.003,
+            "switch_to_catboost": 0.005,
+            "province_independent_model": 0.004,
+        }
+        return penalties.get(name, 0.001)
+
+    def _calc_history_penalty(self, result: Dict) -> float:
+        """对于历史上失败率高的策略，加上罚分."""
+        h = result.get("hypothesis", {})
+        info = h.get("knowledge_info", {})
+        applied = info.get("applied_count", 0)
+        if applied >= 3:
+            success = info.get("success_count", 0)
+            rate = success / applied
+            if rate < self.LOW_SUCCESS_THRESHOLD:
+                return (self.LOW_SUCCESS_THRESHOLD - rate) * 0.02
+        return 0.0
+
+    # ================================================================
+    #  知识库操作
+    # ================================================================
+
     def record_strategy(self, strategy: Dict, scenario: str = "",
                         success: bool = True):
+        """记录策略到知识库."""
         strategy_hash = self._hash(strategy.get("name", ""))
         desc = strategy.get("desc", strategy.get("name", ""))
 
@@ -259,14 +413,25 @@ class Improver:
             ON DUPLICATE KEY UPDATE
                 applied_count = applied_count + 1,
                 success_count = success_count + {1 if success else 0},
-                avg_improvement = (avg_improvement * applied_count + {abs(effect)}) 
+                avg_improvement = (avg_improvement * applied_count + {abs(effect)})
                                   / (applied_count + 1),
                 last_applied = '{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
                 last_effect = {effect}
         """
         self.db.execute(sql)
 
+    def _retire_strategy(self, strategy_sig: str):
+        """退役一个策略."""
+        try:
+            self.db.execute(
+                f"UPDATE strategy_knowledge SET retired = TRUE "
+                f"WHERE strategy_hash = '{strategy_sig}'"
+            )
+        except Exception:
+            pass
+
     def query_knowledge(self, scenario: str) -> List[Dict]:
+        """查询知识库."""
         sql = f"""
             SELECT strategy_hash, strategy_desc, applied_count,
                    success_count, avg_improvement, best_scenario,
@@ -277,16 +442,41 @@ class Improver:
             ORDER BY avg_improvement DESC
             LIMIT 20
         """
-        return self.db.query(sql).to_dict("records") if self.db.table_exists("strategy_knowledge") else []
+        return (
+            self.db.query(sql).to_dict("records")
+            if self.db.table_exists("strategy_knowledge")
+            else []
+        )
+
+    # ================================================================
+    #  完整一轮优化
+    # ================================================================
 
     def improve(self, diagnosis: List[Dict], df: pd.DataFrame,
                 province: str, target_type: str,
                 target_col: str = "value",
                 baseline: Dict = None) -> Dict:
+        """完整一轮自主优化.
+
+        1. 生成假设（知识库加权过滤）
+        2. 竞技场测试（StrategyExecutor 应用变换）
+        3. 选最优（含历史罚分）
+        4. 记录知识库
+        """
         if baseline is None:
             baseline = {"overall_mape": 0.10}
 
         hypotheses = self.generate_hypotheses(diagnosis)
+
+        if not hypotheses:
+            return {
+                "selected_strategy": "",
+                "mape_before": baseline.get("overall_mape"),
+                "mape_after": baseline.get("overall_mape"),
+                "improvement": 0,
+                "knowledge_updated": False,
+                "hypotheses_tested": 0,
+            }
 
         arena_results = self.run_arena(
             hypotheses, df, province, target_type, target_col
@@ -315,8 +505,8 @@ class Improver:
             "mape_before": best.get("mape_before"),
             "mape_after": best.get("mape_after"),
             "improvement": best.get("improvement", 0),
-            "knowledge_updated": True,
             "hypotheses_tested": len([r for r in arena_results if "error" not in r]),
+            "knowledge_updated": True,
         }
 
     @staticmethod
