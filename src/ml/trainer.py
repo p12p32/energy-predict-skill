@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import TimeSeriesSplit
 
 from src.core.config import get_model_config
 
@@ -55,9 +55,11 @@ class Trainer:
         if params:
             lgb_params.update(params)
 
-        X_train, X_val, y_train, y_val = train_test_split(
-            X, y, test_size=0.15, shuffle=False
-        )
+        tscv = TimeSeriesSplit(n_splits=3)
+        _, val_idx = list(tscv.split(X))[-1]
+        train_idx = np.setdiff1d(np.arange(len(X)), val_idx)
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
 
         model = lgb.LGBMRegressor(**lgb_params)
         model.fit(
@@ -118,9 +120,11 @@ class Trainer:
         返回: {"models": {"p10": model, "p50": model, "p90": model}, ...}
         """
         X, y = self.prepare_training_data(df, target_col)
-        X_train, X_val, y_train, y_val = train_test_split(
-            X, y, test_size=0.15, shuffle=False
-        )
+        tscv = TimeSeriesSplit(n_splits=3)
+        _, val_idx = list(tscv.split(X))[-1]
+        train_idx = np.setdiff1d(np.arange(len(X)), val_idx)
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         province_dir = os.path.join(self.model_dir, province)

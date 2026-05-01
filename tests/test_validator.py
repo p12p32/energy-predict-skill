@@ -47,7 +47,7 @@ class TestValidator:
         assert self.validator.should_trigger(metrics, history)
 
     def test_validate_returns_report(self):
-        dates = pd.date_range("2025-01-01", periods=10, freq="H")
+        dates = pd.date_range("2025-01-01", periods=10, freq="h")
         preds = pd.DataFrame({"dt": dates, "province": "广东", "type": "load", "p50": range(10)})
         actuals = pd.DataFrame({"dt": dates, "province": "广东", "type": "load", "value": range(10)})
         report = self.validator.validate(preds, actuals)

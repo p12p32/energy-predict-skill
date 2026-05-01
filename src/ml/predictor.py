@@ -18,11 +18,12 @@ class Predictor:
         self.trainer = trainer or Trainer()
         self.store = store or FeatureStore()
         self.fetcher = DataFetcher()
+        self.ecm = ErrorCorrectionModel()
 
     def predict(self, province: str, target_type: str,
                 horizon_hours: int = 24,
                 model_version: str = None) -> pd.DataFrame:
-        horizon_steps = min(horizon_hours * 4, 96)
+        horizon_steps = horizon_hours * 4
 
         lookback_days = 14
         end_date = datetime.now()
@@ -56,6 +57,20 @@ class Predictor:
 
         trend_pred = self._predict_trend(history, horizon_steps)
         ensemble = self._ensemble(predictions, trend_pred, history)
+
+        # ECM 残差修正
+        if len(history) > 200 and "value" in history.columns:
+            try:
+                recent = history["value"].tail(500).values
+                self.ecm.fit(recent)
+                residual_fix = self.ecm.predict(np.zeros(self.ecm.order), horizon_steps)
+                ensemble["p50"] = np.maximum(ensemble["p50"].values + residual_fix, 0)
+                half_fix = residual_fix / 2
+                ensemble["p10"] = np.maximum(ensemble["p10"].values + half_fix, 0)
+                ensemble["p90"] = np.maximum(ensemble["p90"].values + half_fix, 0)
+            except Exception:
+                pass
+
         self.store.insert_predictions(ensemble)
 
         return ensemble

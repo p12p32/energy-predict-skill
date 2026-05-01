@@ -18,6 +18,13 @@ def load_config(config_path: str = None) -> Dict[str, Any]:
     with open(config_path, "r", encoding="utf-8") as f:
         _CONFIG = yaml.safe_load(f)
 
+    if "doris" in _CONFIG:
+        _CONFIG["doris"]["host"] = os.environ.get("DORIS_HOST", _CONFIG["doris"]["host"])
+        _CONFIG["doris"]["port"] = int(os.environ.get("DORIS_PORT", _CONFIG["doris"]["port"]))
+        _CONFIG["doris"]["user"] = os.environ.get("DORIS_USER", _CONFIG["doris"]["user"])
+        _CONFIG["doris"]["password"] = os.environ.get("DORIS_PASSWORD", _CONFIG["doris"]["password"])
+        _CONFIG["doris"]["database"] = os.environ.get("DORIS_DATABASE", _CONFIG["doris"]["database"])
+
     return _CONFIG
 
 

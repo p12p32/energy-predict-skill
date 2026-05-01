@@ -33,7 +33,7 @@ class TestFileSource:
         assert "value" in result.columns
 
     def test_save_and_load_features(self):
-        dates = pd.date_range("2025-01-01", periods=4, freq="H")
+        dates = pd.date_range("2025-01-01", periods=4, freq="h")
         features = pd.DataFrame({
             "dt": dates, "province": ["广东"] * 4, "type": ["load"] * 4,
             "value": [100, 102, 105, 103], "price": [0.35] * 4,
@@ -46,7 +46,7 @@ class TestFileSource:
         assert len(loaded) == 4
 
     def test_save_and_load_predictions(self):
-        dates = pd.date_range("2025-01-01", periods=4, freq="H")
+        dates = pd.date_range("2025-01-01", periods=4, freq="h")
         preds = pd.DataFrame({
             "dt": dates, "province": ["广东"] * 4, "type": ["load"] * 4,
             "p10": [95, 97, 100, 98], "p50": [100, 102, 105, 103],

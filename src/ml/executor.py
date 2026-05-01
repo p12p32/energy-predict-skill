@@ -176,11 +176,6 @@ class StrategyExecutor:
 
     # ── 参数级变换（透传，由 trainer 处理）──
 
-    def _exec_switch_to_catboost(self, df: pd.DataFrame,
-                                  params: Dict) -> pd.DataFrame:
-        """模型切换：数据本身不变，由 trainer 根据 params 切换模型."""
-        return df
-
     def _exec_province_independent_model(self, df: pd.DataFrame,
                                           params: Dict) -> pd.DataFrame:
         """省份独立建模：数据不变，由 orchestrator 分拆调用."""

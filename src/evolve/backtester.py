@@ -39,7 +39,7 @@ class Backtester:
             model = result["model"]
             feature_names = result["feature_names"]
 
-            test_features = test_df[feature_names].values
+            test_features = test_df[feature_names]
             predictions = model.predict(test_features)
             actuals = test_df[target_col].values
 
@@ -121,9 +121,11 @@ class Backtester:
                         province: str,
                         target_type: str,
                         target_col: str = "value") -> Dict:
+        total_steps = 96 * train_window_days + 4 * test_window_hours
+        n_windows = max(3, min(10, len(df) // (total_steps * 2) if total_steps > 0 else 3))
         rb = self.rolling_window_backtest(
             df, train_window_days, test_window_hours,
-            n_windows=3, province=province,
+            n_windows=n_windows, province=province,
             target_type=target_type, target_col=target_col,
         )
 
@@ -139,7 +141,7 @@ class Backtester:
         bt_result = self.trainer.quick_train(
             last_train, province, target_type, target_col
         )
-        pred = bt_result["model"].predict(last_test[bt_result["feature_names"]].values)
+        pred = bt_result["model"].predict(last_test[bt_result["feature_names"]])
         multi_scores = self.multi_dimension_score(
             last_test[target_col].values, pred, last_test
         )

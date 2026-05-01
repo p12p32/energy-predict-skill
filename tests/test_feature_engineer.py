@@ -34,7 +34,7 @@ class TestFeatureEngineer:
         assert not pd.isna(df["value_lag_1d"].iloc[100])
 
     def test_merge_weather_adds_columns(self):
-        dates = pd.date_range("2025-01-01", periods=10, freq="H")
+        dates = pd.date_range("2025-01-01", periods=10, freq="h")
         features = pd.DataFrame({
             "dt": dates, "province": ["广东"] * 10,
             "type": ["load"] * 10, "value": range(10),

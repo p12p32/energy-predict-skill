@@ -33,12 +33,6 @@ class Improver:
             "applicable": ["drift", "shift"],
         },
         {
-            "name": "switch_to_catboost",
-            "description": "切换模型至 CatBoost",
-            "params": {"model": "catboost"},
-            "applicable": ["variance", "price"],
-        },
-        {
             "name": "province_independent_model",
             "description": "{province} 独立建模",
             "params": {},
@@ -293,14 +287,6 @@ class Improver:
             }
 
     def _extract_model_params(self, hypothesis: Dict) -> Dict:
-        """从假设中提取模型参数（仅模型级策略有）."""
-        name = hypothesis.get("name", "")
-        params = hypothesis.get("params", {})
-
-        if name == "switch_to_catboost":
-            # CatBoost 的等效参数（实际不会生效在 LightGBM，但标记意图）
-            return {"boosting_type": "ordered"}
-
         return {}
 
     # ================================================================

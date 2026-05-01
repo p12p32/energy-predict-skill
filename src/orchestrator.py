@@ -4,8 +4,8 @@ import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
-from src.core.config import get_provinces, get_types
-from src.core.data_source import FileSource
+from src.core.config import get_provinces, get_types, load_config
+from src.core.data_source import FileSource, MemorySource
 from src.data.features import FeatureStore, FeatureEngineer
 from src.data.fetcher import DataFetcher
 from src.ml.trainer import Trainer
@@ -22,7 +22,15 @@ logger = logging.getLogger(__name__)
 
 class Orchestrator:
     def __init__(self):
-        self.source = FileSource()
+        cfg = load_config()
+        ds_type = cfg.get("data_source", "file")
+        if ds_type == "doris":
+            from src.core.db import DorisDB
+            self.source = DorisDB()
+        elif ds_type == "memory":
+            self.source = MemorySource()
+        else:
+            self.source = FileSource()
         self.store = FeatureStore(self.source)
         self.trainer = Trainer()
         self.backtester = Backtester(self.trainer)
@@ -237,28 +245,44 @@ class Orchestrator:
             "diagnoses": diagnosis,
         }
 
-    def train_all(self):
+    def _scan_available(self) -> list:
+        """返回有数据的 (province, type) 列表."""
         end = datetime.now()
         start = end - timedelta(days=90)
-
+        available = []
         for province in get_provinces():
             for target_type in get_types():
-                logger.info(f"训练: {province}/{target_type}")
-
                 df = self.store.load_features(
                     province, target_type,
                     start.strftime("%Y-%m-%d"),
                     (end + timedelta(days=1)).strftime("%Y-%m-%d"),
                 )
-                if df.empty:
-                    logger.warning(f"  无数据: {province}/{target_type}")
-                    continue
+                if not df.empty and len(df) >= 96:
+                    available.append((province, target_type))
+        return available
 
-                result = self.trainer.train(df, province, target_type)
-                logger.info(
-                    f"  完成: n={result['n_samples']}, "
-                    f"features={result['n_features']}"
-                )
+    def train_all(self):
+        available = self._scan_available()
+        if not available:
+            logger.warning("无可用数据，跳过训练")
+            return
+
+        logger.info(f"扫描到 {len(available)} 组有数据的 (province, type)，开始训练...")
+        end = datetime.now()
+        start = end - timedelta(days=90)
+
+        for province, target_type in available:
+            logger.info(f"训练: {province}/{target_type}")
+            df = self.store.load_features(
+                province, target_type,
+                start.strftime("%Y-%m-%d"),
+                (end + timedelta(days=1)).strftime("%Y-%m-%d"),
+            )
+            result = self.trainer.train(df, province, target_type)
+            logger.info(
+                f"  完成: n={result['n_samples']}, "
+                f"features={result['n_features']}"
+            )
 
     # ── Tier 2 新增方法 ──
 
