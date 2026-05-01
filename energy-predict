@@ -7,7 +7,7 @@ cd "$ENERGY_HOME"
 
 case "$1" in
   import)
-    python3 -c "
+    python -c "
 from src.core.data_source import FileSource
 fs = FileSource()
 result = fs.import_csv('$2')
@@ -16,7 +16,7 @@ print(result)
     ;;
 
   predict)
-    python3 -c "
+    python -c "
 from src.orchestrator import Orchestrator
 import json
 o = Orchestrator()
@@ -31,7 +31,7 @@ if len(result.get('sample', [])) > 5:
 
   status)
     if [ -f models/model_registry.json ]; then
-      python3 -c "
+      python -c "
 import json
 with open('models/model_registry.json') as f:
     r = json.load(f)
@@ -44,7 +44,7 @@ for k, v in sorted(r.items()):
     ;;
 
   explain)
-    python3 -c "
+    python -c "
 from src.orchestrator import Orchestrator
 o = Orchestrator()
 result = o.explain('${2:-广东}', '${3:-load}')
@@ -54,15 +54,15 @@ for f in result.get('feature_importance', [])[:10]:
     ;;
 
   benchmark)
-    python3 tests/benchmark.py
+    python tests/benchmark.py
     ;;
 
   daemon)
-    python3 src/daemon.py --interval "${2:-15}"
+    python src/daemon.py --interval "${2:-15}"
     ;;
 
   export)
-    python3 -c "
+    python -c "
 from src.orchestrator import Orchestrator
 o = Orchestrator()
 result = o.export('${2:-广东}', '${3:-load}', fmt='${4:-json}')
