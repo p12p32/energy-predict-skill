@@ -1,0 +1,85 @@
+#!/bin/bash
+# energy-predict — 电力预测 Skill 命令行入口
+# 用法: energy-predict {import|predict|status|explain|benchmark|daemon}
+
+export ENERGY_HOME="${ENERGY_HOME:-$(cd "$(dirname "$0")" && pwd)}"
+cd "$ENERGY_HOME"
+
+case "$1" in
+  import)
+    python3 -c "
+from src.core.data_source import FileSource
+fs = FileSource()
+result = fs.import_csv('$2')
+print(result)
+"
+    ;;
+
+  predict)
+    python3 -c "
+from src.orchestrator import Orchestrator
+import json
+o = Orchestrator()
+result = o.predict('${2:-广东}', '${3:-load}', ${4:-24})
+print(f'预测步数: {result[\"n_predictions\"]}')
+for r in result.get('sample', [])[:5]:
+    print(f\"  {r['dt']}  P50={r['p50']:,.0f}\")
+if len(result.get('sample', [])) > 5:
+    print(f'  ... 共 {len(result[\"sample\"])} 步')
+"
+    ;;
+
+  status)
+    if [ -f models/model_registry.json ]; then
+      python3 -c "
+import json
+with open('models/model_registry.json') as f:
+    r = json.load(f)
+for k, v in sorted(r.items()):
+    print(f'{k}: updated={v.get(\"updated_at\",\"?\")} | features={len(v.get(\"feature_names\",[]))} | versions={len(v.get(\"versions\",[]))}')
+"
+    else
+      echo "尚未训练任何模型。请先导入数据: energy-predict import data.csv"
+    fi
+    ;;
+
+  explain)
+    python3 -c "
+from src.orchestrator import Orchestrator
+o = Orchestrator()
+result = o.explain('${2:-广东}', '${3:-load}')
+for f in result.get('feature_importance', [])[:10]:
+    print(f\"  #{f['rank']:2d} {f['feature']:<30s} {f['pct']:5.1f}%\")
+"
+    ;;
+
+  benchmark)
+    python3 tests/benchmark.py
+    ;;
+
+  daemon)
+    python3 src/daemon.py --interval "${2:-15}"
+    ;;
+
+  export)
+    python3 -c "
+from src.orchestrator import Orchestrator
+o = Orchestrator()
+result = o.export('${2:-广东}', '${3:-load}', fmt='${4:-json}')
+print(result)
+"
+    ;;
+
+  *)
+    echo "电力预测 Skill — 用法:"
+    echo "  energy-predict import <csv路径>          导入CSV数据"
+    echo "  energy-predict predict <省> <类型> <小时>  预测"
+    echo "  energy-predict status                     查看模型状态"
+    echo "  energy-predict explain <省> <类型>         特征重要性"
+    echo "  energy-predict export <省> <类型> <格式>   导出预测"
+    echo "  energy-predict benchmark                  精度基准测试"
+    echo "  energy-predict daemon [分钟]               自动调度运行"
+    echo ""
+    echo "  示例: energy-predict predict 广东 load 24"
+    ;;
+esac

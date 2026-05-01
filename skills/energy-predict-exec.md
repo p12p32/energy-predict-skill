@@ -1,57 +1,40 @@
 ---
 name: energy-predict-exec
-description: 预测执行层 — LightGBM + 趋势模型集成预测
+description: 预测执行层 Skill — 集成预测+趋势+分位数。被主 Skill 调用。
 ---
-
-# 预测执行层 Skill
-
-被主 Skill `energy-predict` 调用。执行预测并写入数据库。
 
 ## 工作空间
 
-`/Users/pcy/analysSkills`
+`$ENERGY_HOME`
 
-## 命令
-
-### /predict-exec <省份> <类型> <时间范围>
-
-```
-/predict-exec 广东 load 24
-```
+## 预测
 
 ```bash
-python3 -c "
+cd $ENERGY_HOME && python3 -c "
 from src.orchestrator import Orchestrator
-import json
-
 o = Orchestrator()
 result = o.predict('广东', 'load', 24)
-
-print(f'预测步数: {result[\"n_predictions\"]}')
 for r in result.get('sample', []):
-    print(f\"  {r['dt']}  P50={r['p50']:,.0f}\")
-"
-
-# 多省
-for p in ['广东', '云南', '四川']:
-    try:
-        result = o.predict(p, 'load', 24)
-        print(f'{p}: {result[\"n_predictions\"]}步')
-    except Exception as e:
-        print(f'{p}: 预测失败 - {e}')
+    print(f\"{r['dt']}  P50={r['p50']:,.0f}\")
 "
 ```
 
-### 输出格式
+输出格式化为表格。如有 `trend_adjusted: True`，注明"集成预测 (LightGBM + 趋势模型)"。
 
-将 predict 返回的 sample 列表格式化为表格：
+## ASCII 图表
 
+```bash
+cd $ENERGY_HOME && python3 -c "
+from src.orchestrator import Orchestrator
+print(Orchestrator().chart('广东', 'load', 24))
+"
 ```
-┌──────────────────────┬──────────┬──────────┬──────────┐
-│ 时间                  │ P10       │ P50       │ P90       │
-├──────────────────────┼──────────┼──────────┼──────────┤
-│ ...                   │ ...       │ ...       │ ...       │
-└──────────────────────┴──────────┴──────────┴──────────┘
 
-集成模式: LightGBM(75%) + 趋势模型(25%) 动态加权
+## 导出结果
+
+```bash
+cd $ENERGY_HOME && python3 -c "
+from src.orchestrator import Orchestrator
+print(Orchestrator().export('广东', 'load', fmt='csv'))
+"
 ```

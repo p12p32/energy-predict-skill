@@ -4,6 +4,7 @@ import yaml
 from typing import Any, Dict
 
 _CONFIG: Dict[str, Any] = {}
+_SKILL_HOME = os.environ.get("ENERGY_HOME", os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 
 def load_config(config_path: str = None) -> Dict[str, Any]:
@@ -12,9 +13,7 @@ def load_config(config_path: str = None) -> Dict[str, Any]:
         return _CONFIG
 
     if config_path is None:
-        config_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "config.yaml"
-        )
+        config_path = os.path.join(_SKILL_HOME, "config.yaml")
 
     with open(config_path, "r", encoding="utf-8") as f:
         _CONFIG = yaml.safe_load(f)
