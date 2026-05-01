@@ -49,7 +49,7 @@ energy-predict (主Skill, 本文件) — 命令路由
 解析: 出力→output, 负荷→load, 电价→price。未来N小时→N, 未来N天→N×24, 下周→168, 下个月→720。
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+cd $ENERGY_HOME && ${PYTHON:-python3} -c "
 from src.orchestrator import Orchestrator
 o = Orchestrator()
 result = o.predict('广东', 'load', 24)
@@ -65,7 +65,7 @@ for r in result.get('sample', []):
 ## /import <csv路径>
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+cd $ENERGY_HOME && ${PYTHON:-python3} -c "
 from src.core.data_source import FileSource
 FileSource().import_csv('data/my_data.csv')
 "
@@ -78,7 +78,7 @@ CSV 必须包含: `dt`, `province`, `type`, `value`。可选: `price`。
 ## /backtest <省份> <类型>
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+cd $ENERGY_HOME && ${PYTHON:-python3} -c "
 from src.orchestrator import Orchestrator
 import json
 o = Orchestrator()
@@ -93,7 +93,7 @@ print(f\"诊断: {json.dumps(result.get('diagnoses', []), ensure_ascii=False)}\"
 ## /status [省份]
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+cd $ENERGY_HOME && ${PYTHON:-python3} -c "
 import os, json
 path = 'models/model_registry.json'
 if os.path.exists(path):
@@ -112,7 +112,7 @@ else:
 ## /retrain [省份] [类型]
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+cd $ENERGY_HOME && ${PYTHON:-python3} -c "
 from src.orchestrator import Orchestrator
 o = Orchestrator()
 o.train_all()
@@ -124,7 +124,7 @@ o.train_all()
 ## /improve <省份> <类型>
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+cd $ENERGY_HOME && ${PYTHON:-python3} -c "
 from src.orchestrator import Orchestrator
 import json
 o = Orchestrator()
@@ -138,7 +138,7 @@ print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 ## /explain <省份> <类型>
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+cd $ENERGY_HOME && ${PYTHON:-python3} -c "
 from src.orchestrator import Orchestrator
 o = Orchestrator()
 result = o.explain('广东', 'load')
@@ -152,7 +152,7 @@ for f in result['feature_importance'][:10]:
 ## /rollback <省份> <类型>
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+cd $ENERGY_HOME && ${PYTHON:-python3} -c "
 from src.orchestrator import Orchestrator
 o = Orchestrator()
 result = o.rollback_model('广东', 'load')
@@ -165,7 +165,7 @@ print(result)
 ## /validate <省份> <类型>
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+cd $ENERGY_HOME && ${PYTHON:-python3} -c "
 from src.orchestrator import Orchestrator
 import json
 o = Orchestrator()
@@ -179,7 +179,7 @@ print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 ## /export <省份> <类型> [格式]
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+cd $ENERGY_HOME && ${PYTHON:-python3} -c "
 from src.orchestrator import Orchestrator
 o = Orchestrator()
 print(o.export('广东', 'load', fmt='csv'))
@@ -191,7 +191,7 @@ print(o.export('广东', 'load', fmt='csv'))
 ## /chart <省份> <类型> [小时]
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+cd $ENERGY_HOME && ${PYTHON:-python3} -c "
 from src.orchestrator import Orchestrator
 print(Orchestrator().chart('广东', 'load', 24))
 "
@@ -204,9 +204,9 @@ print(Orchestrator().chart('广东', 'load', 24))
 ```bash
 cd $ENERGY_HOME
 # 持续运行
-python3 src/daemon.py --interval 15 &
+${PYTHON:-python3} src/daemon.py --interval 15 &
 # 单次测试
-python3 src/daemon.py --once
+${PYTHON:-python3} src/daemon.py --once
 ```
 
 ---
@@ -214,7 +214,7 @@ python3 src/daemon.py --once
 ## /benchmark
 
 ```bash
-cd $ENERGY_HOME && python3 tests/benchmark.py
+cd $ENERGY_HOME && ${PYTHON:-python3} tests/benchmark.py
 ```
 
 ---

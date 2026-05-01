@@ -5,9 +5,12 @@
 export ENERGY_HOME="${ENERGY_HOME:-$(cd "$(dirname "$0")" && pwd)}"
 cd "$ENERGY_HOME"
 
+# 自动探测 Python (适配不同机器)
+PYTHON=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || command -v python3.11 2>/dev/null || echo "python3")
+
 case "$1" in
   import)
-    python3 -c "
+    $PYTHON -c "
 from src.core.data_source import FileSource
 fs = FileSource()
 result = fs.import_csv('$2')
@@ -16,7 +19,7 @@ print(result)
     ;;
 
   predict)
-    python3 -c "
+    $PYTHON -c "
 from src.orchestrator import Orchestrator
 import json
 o = Orchestrator()
@@ -31,7 +34,7 @@ if len(result.get('sample', [])) > 5:
 
   status)
     if [ -f models/model_registry.json ]; then
-      python3 -c "
+      $PYTHON -c "
 import json
 with open('models/model_registry.json') as f:
     r = json.load(f)
@@ -44,7 +47,7 @@ for k, v in sorted(r.items()):
     ;;
 
   explain)
-    python3 -c "
+    $PYTHON -c "
 from src.orchestrator import Orchestrator
 o = Orchestrator()
 result = o.explain('${2:-广东}', '${3:-load}')
@@ -54,15 +57,15 @@ for f in result.get('feature_importance', [])[:10]:
     ;;
 
   benchmark)
-    python3 tests/benchmark.py
+    $PYTHON tests/benchmark.py
     ;;
 
   daemon)
-    python3 src/daemon.py --interval "${2:-15}"
+    $PYTHON src/daemon.py --interval "${2:-15}"
     ;;
 
   export)
-    python3 -c "
+    $PYTHON -c "
 from src.orchestrator import Orchestrator
 o = Orchestrator()
 result = o.export('${2:-广东}', '${3:-load}', fmt='${4:-json}')

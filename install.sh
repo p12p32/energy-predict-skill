@@ -8,6 +8,10 @@ echo ""
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# 自动探测 Python / Pip
+PYTHON=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || echo "python3")
+PIP=$(command -v pip3 2>/dev/null || command -v pip 2>/dev/null || echo "pip3")
+
 # ── Shell 探测 ──
 detect_shell_rc() {
     local shell_name
@@ -40,25 +44,25 @@ echo "[1/3] 安装 Python 依赖..."
 # 基础包 (无需编译, 快速)
 BASE_PKGS="pandas numpy pymysql pyyaml scikit-learn requests pyarrow pytest"
 echo "  安装基础包..."
-pip3 install --user $BASE_PKGS 2>/dev/null || pip3 install $BASE_PKGS 2>/dev/null || {
-    echo "  ⚠ pip3 失败, 尝试 pip..."
+$PIP install --user $BASE_PKGS 2>/dev/null || $PIP install $BASE_PKGS 2>/dev/null || {
+    echo "  ⚠ $PIP 失败, 尝试 pip..."
     pip install --user $BASE_PKGS 2>/dev/null || pip install $BASE_PKGS
 }
 
 # LightGBM (需编译, 可选)
 if [ "$NEEDS_LGB" = true ]; then
     echo "  安装 LightGBM (编译中, 约 1-3 分钟)..."
-    pip3 install --user lightgbm 2>/dev/null || pip3 install lightgbm 2>/dev/null || {
+    $PIP install --user lightgbm 2>/dev/null || $PIP install lightgbm 2>/dev/null || {
         echo "  ⚠ LightGBM 编译失败"
-        echo "    可手动安装: brew install libomp && pip3 install lightgbm (macOS)"
-        echo "    或: pip3 install lightgbm --no-cache-dir (重试)"
+        echo "    可手动安装: brew install libomp && $PIP install lightgbm (macOS)"
+        echo "    或: $PIP install lightgbm --no-cache-dir (重试)"
         echo "    预测功能仍可用, 训练需要 LightGBM"
     }
 fi
 
 # Prophet (可选)
 echo "  安装 Prophet..."
-pip3 install --user prophet 2>/dev/null || pip3 install prophet 2>/dev/null || echo "  Prophet 跳过(可选, 不影响核心功能)"
+$PIP install --user prophet 2>/dev/null || $PIP install prophet 2>/dev/null || echo "  Prophet 跳过(可选, 不影响核心功能)"
 
 echo "  依赖安装完成"
 
@@ -80,10 +84,10 @@ echo "[3/3] 验证安装..."
 chmod +x "$SCRIPT_DIR/energy-predict"
 export ENERGY_HOME="$SCRIPT_DIR"
 
-python3 -c "from src.core.config import load_config; load_config(); print('  ✅ 配置加载')" 2>/dev/null || echo "  ⚠ 配置加载失败 (检查 config.yaml)"
-python3 -c "import pandas, numpy; print(f'  ✅ pandas {pandas.__version__}, numpy {numpy.__version__}')" 2>/dev/null || echo "  ⚠ pandas/numpy 未安装"
-python3 -c "import lightgbm; print(f'  ✅ LightGBM {lightgbm.__version__}')" 2>/dev/null || echo "  ⚠ LightGBM 未安装 (轻量模式, 无训练功能)"
-python3 -c "import requests; print('  ✅ requests OK')" 2>/dev/null || echo "  ⚠ requests 未安装"
+$PYTHON -c "from src.core.config import load_config; load_config(); print('  ✅ 配置加载')" 2>/dev/null || echo "  ⚠ 配置加载失败 (检查 config.yaml)"
+$PYTHON -c "import pandas, numpy; print(f'  ✅ pandas {pandas.__version__}, numpy {numpy.__version__}')" 2>/dev/null || echo "  ⚠ pandas/numpy 未安装"
+$PYTHON -c "import lightgbm; print(f'  ✅ LightGBM {lightgbm.__version__}')" 2>/dev/null || echo "  ⚠ LightGBM 未安装 (轻量模式, 无训练功能)"
+$PYTHON -c "import requests; print('  ✅ requests OK')" 2>/dev/null || echo "  ⚠ requests 未安装"
 
 echo ""
 echo "============================================"
