@@ -71,13 +71,10 @@ $PIP install --user prophet 2>/dev/null || $PIP install prophet 2>/dev/null || e
 
 echo "  依赖安装完成"
 
-# ── 2. 环境变量 ──
+# ── 2. 别名 ──
 echo ""
-echo "[2/3] 设置环境变量..."
+echo "[2/3] 设置命令别名..."
 
-if ! grep -q "ENERGY_HOME" "$RC_FILE" 2>/dev/null; then
-  echo "export ENERGY_HOME=\"$SCRIPT_DIR\"" >> "$RC_FILE"
-fi
 if ! grep -q "energy-predict" "$RC_FILE" 2>/dev/null; then
   echo "alias energy-predict=\"$SCRIPT_DIR/assets/energy-predict\"" >> "$RC_FILE"
 fi
