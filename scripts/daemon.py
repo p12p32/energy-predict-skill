@@ -13,6 +13,7 @@ from typing import Dict, List
 from scripts.orchestrator import Orchestrator
 from scripts.data_watcher import DataWatcher
 from scripts.core.config import get_provinces, get_types, load_config
+from scripts.core.monitoring import MonitoringServer, record_prediction
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,6 +35,7 @@ class Daemon:
         self.rounds: Dict[str, int] = {}
         self.last_mape: Dict[str, float] = {}
         self.last_predict: Dict[str, datetime] = {}
+        self._monitor: MonitoringServer = None
 
     def start(self, once: bool = False):
         self.running = True
@@ -48,6 +50,14 @@ class Daemon:
         logger.info(f"能源预测引擎 启动 (数据源: {ds_type})")
         logger.info(f"覆盖 {len(get_provinces())} 省 × {len(get_types())} 类型")
         logger.info("=" * 50)
+
+        # 启动监控端点
+        try:
+            self._monitor = MonitoringServer(port=9090)
+            self._monitor.start()
+            logger.info("监控端点已启动: http://0.0.0.0:9090 (health/metrics)")
+        except Exception as e:
+            logger.warning(f"监控端点启动失败: {e}")
 
         # 首次训练（如果没有已有模型）
         try:
@@ -66,6 +76,10 @@ class Daemon:
         else:
             self._continuous_loop(ds_type, watch_dir)
 
+        # 关闭监控
+        if self._monitor:
+            self._monitor.stop()
+
     def _single_run(self, ds_type: str, watch_dir: str):
         """单次: 拉取最新数据 → 预测 → 验证."""
         new_batches = self._fetch_new_data(ds_type, watch_dir)
@@ -76,8 +90,8 @@ class Daemon:
                 for target_type in get_types():
                     try:
                         self.orch.predict(province, target_type, 24)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("预测失败 (%s/%s): %s", province, target_type, e)
         else:
             self._run_cycle()
 
@@ -137,6 +151,11 @@ class Daemon:
             pred_result = self.orch.predict(province, target_type, 24)
             n_pred = pred_result.get("n_predictions", 0)
             self.last_predict[key] = datetime.now()
+            health = pred_result.get("health", {})
+            record_prediction(province, target_type,
+                            health.get("mape", 0) or 0,
+                            n_pred,
+                            health.get("status", "ok"))
             logger.info(f"[{key}#{round_num}] 预测完成: {n_pred} 步")
 
             # 如果已有历史预测可对比 → 验证
@@ -157,7 +176,12 @@ class Daemon:
                 rn = self.rounds[key]
 
                 try:
-                    self.orch.predict(province, target_type, 24)
+                    pred_result = self.orch.predict(province, target_type, 24)
+                    health = pred_result.get("health", {})
+                    record_prediction(province, target_type,
+                                    health.get("mape", 0) or 0,
+                                    pred_result.get("n_predictions", 0),
+                                    health.get("status", "ok"))
                     if rn > 1:
                         self._validate_and_improve(province, target_type, key, rn)
                 except Exception as e:

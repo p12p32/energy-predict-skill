@@ -121,6 +121,14 @@ class FeatureEngineer:
         # ── 周期编码 ──
         df = add_cyclical_features(df)
 
+        # ── 交互特征 ──
+        df["peak_valley"] = df["hour"].apply(
+            lambda h: 2 if h in [8, 9, 10, 11, 17, 18, 19, 20] else
+                      1 if h in [12, 13, 14, 21, 22] else 0
+        )
+        df["weekend_hour"] = df["is_weekend"].astype(int) * df["hour"]
+        df["dow_hour"] = df["day_of_week"] * 24 + df["hour"]
+
         # ── 滞后特征 ──
         for group_key, group_df in df.groupby(["province", "type"]):
             idx = group_df.index
@@ -135,7 +143,70 @@ class FeatureEngineer:
                 group_df["value"].rolling(window=96, min_periods=1).mean().values
             )
 
+        # ── 滞后交互特征 (依赖已计算的 lag) ──
+        if "value_lag_7d" in df.columns:
+            df["weekend_x_lag7d"] = df["is_weekend"].astype(int) * df["value_lag_7d"]
+        if "hour" in df.columns and "value_lag_1d" in df.columns:
+            df["hour_x_lag1d"] = df["hour"] * df["value_lag_1d"]
+
+        # ── 波动率特征 ──
+        for group_key, group_df in df.groupby(["province", "type"]):
+            idx = group_df.index
+            df.loc[idx, "value_rolling_std_24h"] = (
+                group_df["value"].rolling(window=96, min_periods=1).std().values
+            )
+            df.loc[idx, "value_rolling_max_24h"] = (
+                group_df["value"].rolling(window=96, min_periods=1).max().values
+            )
+            df.loc[idx, "value_rolling_min_24h"] = (
+                group_df["value"].rolling(window=96, min_periods=1).min().values
+            )
+            df.loc[idx, "value_range_24h"] = (
+                df.loc[idx, "value_rolling_max_24h"] - df.loc[idx, "value_rolling_min_24h"]
+            )
+
+        # ── 天气×时间交互 ──
+        if "temperature" in df.columns and "hour" in df.columns:
+            df["temp_x_hour"] = df["temperature"] * df["hour"]
+        if "wind_speed" in df.columns and "season" in df.columns:
+            df["wind_x_season"] = df["wind_speed"] * df["season"]
+        if "temperature" in df.columns and "humidity" in df.columns:
+            df["temp_x_humidity"] = df["temperature"] * df["humidity"] / 100
+
         return df
+
+    def add_cross_type_features(self, features: pd.DataFrame,
+                                 cross_df: pd.DataFrame,
+                                 other_type: str) -> pd.DataFrame:
+        """从其他类型数据注入交叉特征。完全数据驱动，不预设任何关系。"""
+        cross_val_col = "value"
+        if cross_val_col not in cross_df.columns:
+            return features
+
+        # 对齐时间粒度
+        features["_dt_hour"] = features["dt"].dt.floor("h")
+        cross_subset = cross_df[["dt", cross_val_col]].copy()
+        cross_subset["_dt_hour"] = cross_subset["dt"].dt.floor("h")
+        cross_agg = cross_subset.groupby("_dt_hour")[cross_val_col].mean().reset_index()
+        cross_agg.columns = ["_dt_hour", f"{other_type}_value"]
+
+        result = features.merge(cross_agg, on="_dt_hour", how="left")
+        result.drop(columns=["_dt_hour"], inplace=True)
+
+        # 为 cross value 创建滞后特征
+        col = f"{other_type}_value"
+        if col in result.columns:
+            result = result.sort_values("dt")
+            result[f"{other_type}_lag_1d"] = result[col].shift(96)
+            result[f"{other_type}_lag_7d"] = result[col].shift(672)
+
+        # 价格专项: 出力/负荷 → 供需比
+        if "output_value" in result.columns and "load_value" in result.columns:
+            result["supply_demand_ratio"] = (
+                result["output_value"] / result["load_value"].replace(0, None)
+            )
+
+        return result
 
     def merge_weather(self, features: pd.DataFrame,
                       weather: pd.DataFrame) -> pd.DataFrame:
@@ -172,26 +243,8 @@ class FeatureStore:
         self.source.setup()
 
     def insert_features(self, df: pd.DataFrame) -> int:
-        cols = [
-            "dt", "province", "type", "value", "price",
-            "hour", "day_of_week", "day_of_month", "month",
-            "is_weekend", "season",
-            "temperature", "humidity", "wind_speed", "wind_direction",
-            "solar_radiation", "precipitation", "pressure",
-            "CDD", "HDD", "THI", "wind_power_potential",
-            "solar_potential", "solar_efficiency",
-            "temp_change_1h", "temp_change_6h", "consecutive_hot_days",
-            "value_lag_1d", "value_lag_7d",
-            "value_rolling_mean_24h",
-            "value_diff_1d", "value_diff_7d",
-            "is_holiday", "is_work_weekend",
-            "days_to_holiday", "days_from_holiday",
-            "hour_sin", "hour_cos", "dow_sin", "dow_cos",
-            "month_sin", "month_cos",
-            "quality_flag",
-        ]
-        available = [c for c in cols if c in df.columns]
-        return self.source.save_features(df[available])
+        # 保存全部列，不再硬编码白名单
+        return self.source.save_features(df)
 
     def insert_predictions(self, df: pd.DataFrame) -> int:
         cols = ["dt", "province", "type", "p10", "p50", "p90",
@@ -202,7 +255,7 @@ class FeatureStore:
         return self.source.save_predictions(df[available])
 
     def load_features(self, province: str, data_type: str,
-                      start_date: str, end_date: str) -> pd.DataFrame:
+                      start_date: str = None, end_date: str = None) -> pd.DataFrame:
         return self.source.load_features(province, data_type, start_date, end_date)
 
     def load_raw_data(self, province: str, data_type: str,

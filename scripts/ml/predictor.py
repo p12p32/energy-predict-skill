@@ -1,15 +1,18 @@
 """predictor.py — 预测执行器: 未来特征外推 + 分位数预测 + 趋势集成 + ECM"""
+import logging
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict
+
+logger = logging.getLogger(__name__)
 
 from scripts.ml.trainer import Trainer
 from scripts.ml.trend import TrendModel
 from scripts.ml.error_correction import ErrorCorrectionModel
 from scripts.data.features import FeatureStore
 from scripts.data.fetcher import DataFetcher
-from scripts.core.config import load_config
+from scripts.core.config import load_config, validate_province_and_type
 
 
 class Predictor:
@@ -20,9 +23,15 @@ class Predictor:
         self.fetcher = DataFetcher()
         self.ecm = ErrorCorrectionModel()
 
+    @staticmethod
+    def _allow_negative(target_type: str) -> bool:
+        """price 类型允许负值预测 (山东电力市场可能出现负电价)."""
+        return target_type == "price"
+
     def predict(self, province: str, target_type: str,
                 horizon_hours: int = 24,
                 model_version: str = None) -> pd.DataFrame:
+        validate_province_and_type(province, target_type)
         horizon_steps = horizon_hours * 4
 
         lookback_days = 14
@@ -56,7 +65,7 @@ class Predictor:
             )
 
         trend_pred = self._predict_trend(history, horizon_steps)
-        ensemble = self._ensemble(predictions, trend_pred, history)
+        ensemble = self._ensemble(predictions, trend_pred, history, target_type)
 
         # ECM 残差修正
         if len(history) > 200 and "value" in history.columns:
@@ -64,12 +73,21 @@ class Predictor:
                 recent = history["value"].tail(500).values
                 self.ecm.fit(recent)
                 residual_fix = self.ecm.predict(np.zeros(self.ecm.order), horizon_steps)
-                ensemble["p50"] = np.maximum(ensemble["p50"].values + residual_fix, 0)
+                allow_neg = self._allow_negative(target_type)
+                ensemble["p50"] = ensemble["p50"].values + residual_fix
+                if not allow_neg:
+                    ensemble["p50"] = np.maximum(ensemble["p50"], 0)
                 half_fix = residual_fix / 2
-                ensemble["p10"] = np.maximum(ensemble["p10"].values + half_fix, 0)
-                ensemble["p90"] = np.maximum(ensemble["p90"].values + half_fix, 0)
-            except Exception:
-                pass
+                ensemble["p10"] = ensemble["p10"].values + half_fix
+                ensemble["p90"] = ensemble["p90"].values + half_fix
+                if not allow_neg:
+                    ensemble["p10"] = np.maximum(ensemble["p10"], 0)
+                    ensemble["p90"] = np.maximum(ensemble["p90"], 0)
+            except Exception as e:
+                logger.warning("ECM 残差修正失败 (%s/%s): %s", province, target_type, e)
+
+        # 自适应区间校准
+        ensemble = self._calibrate_intervals(ensemble, history, province, target_type)
 
         self.store.insert_predictions(ensemble)
 
@@ -90,12 +108,16 @@ class Predictor:
                 features_df[fn] = 0.0
         X = features_df[feature_names].values
 
+        raw_p10 = p10_model.predict(X) if p10_model else np.zeros(len(X))
+        raw_p50 = p50_model.predict(X)
+        raw_p90 = p90_model.predict(X) if p90_model else np.zeros(len(X))
+        allow_neg = self._allow_negative(target_type)
         result = pd.DataFrame({
             "dt": features_df["dt"].values,
             "province": province, "type": target_type,
-            "p10": np.maximum(p10_model.predict(X), 0) if p10_model else np.zeros(len(X)),
-            "p50": np.maximum(p50_model.predict(X), 0),
-            "p90": np.maximum(p90_model.predict(X), 0) if p90_model else np.zeros(len(X)),
+            "p10": raw_p10 if allow_neg else np.maximum(raw_p10, 0),
+            "p50": raw_p50 if allow_neg else np.maximum(raw_p50, 0),
+            "p90": raw_p90 if allow_neg else np.maximum(raw_p90, 0),
             "model_version": "quantile_v1",
         })
         return result
@@ -113,7 +135,8 @@ class Predictor:
 
     def _ensemble(self, lgb_result: pd.DataFrame,
                   trend_preds: np.ndarray,
-                  history: pd.DataFrame) -> pd.DataFrame:
+                  history: pd.DataFrame,
+                  target_type: str = "load") -> pd.DataFrame:
         n = len(lgb_result)
         trend_preds = trend_preds[:n]
         lgb_weight = np.array([max(0.3, 0.75 - 0.005 * i) for i in range(n)])
@@ -121,10 +144,14 @@ class Predictor:
         lgb_p50 = lgb_result["p50"].values
         ensemble_p50 = lgb_weight * lgb_p50 + trend_weight * trend_preds
         result = lgb_result.copy()
-        result["p50"] = np.maximum(ensemble_p50, 0)
-        width = result["p90"].values - result["p10"].values
-        result["p10"] = np.maximum(ensemble_p50 - width / 2, 0)
-        result["p90"] = np.maximum(ensemble_p50 + width / 2, 0)
+        allow_neg = self._allow_negative(target_type)
+        result["p50"] = ensemble_p50 if allow_neg else np.maximum(ensemble_p50, 0)
+        p50_shift = result["p50"].values - lgb_p50
+        result["p10"] = lgb_result["p10"].values + p50_shift
+        result["p90"] = lgb_result["p90"].values + p50_shift
+        if not allow_neg:
+            result["p10"] = np.maximum(result["p10"], 0)
+            result["p90"] = np.maximum(result["p90"], 0)
         result["trend_adjusted"] = True
         return result
 
@@ -172,6 +199,16 @@ class Predictor:
         future_df = add_holiday_features(future_df)
         future_df = add_cyclical_features(future_df)
         future_df["quality_flag"] = 0
+
+        # 交互特征
+        future_df["peak_valley"] = future_df["hour"].apply(
+            lambda h: 2 if h in [8, 9, 10, 11, 17, 18, 19, 20] else
+                      1 if h in [12, 13, 14, 21, 22] else 0
+        )
+        future_df["weekend_hour"] = future_df["is_weekend"].astype(int) * future_df["hour"]
+        future_df["dow_hour"] = future_df["day_of_week"] * 24 + future_df["hour"]
+        future_df["weekend_x_lag7d"] = future_df["is_weekend"].astype(int) * future_df["value_lag_7d"]
+        future_df["hour_x_lag1d"] = future_df["hour"] * future_df["value_lag_1d"]
         for col in ["temperature", "humidity", "wind_speed", "wind_direction",
                      "solar_radiation", "precipitation", "pressure"]:
             if col not in future_df.columns:
@@ -194,8 +231,8 @@ class Predictor:
                             future_df[col] = future_df[col].fillna(
                                 history[col].mean() if col in history.columns else 0)
                 future_df.drop(columns=["dt_merge"], inplace=True, errors="ignore")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("气象数据获取失败 (%s/%s): %s", province, target_type, e)
         for col in future_df.columns:
             if col not in ("dt", "province", "type") and future_df[col].dtype == np.float64:
                 future_df[col] = future_df[col].fillna(
@@ -222,14 +259,89 @@ class Predictor:
                     if mask.sum() > 10:
                         residuals = (hist_actual[mask] - hist_pred[mask]) / hist_actual[mask]
                         residual_std = float(np.std(residuals))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("残差标准差计算失败 (%s/%s): %s", province, target_type, e)
         p10 = predicted * (1 - 1.28 * residual_std)
         p90 = predicted * (1 + 1.28 * residual_std)
         result = pd.DataFrame({
             "dt": features_df["dt"].values, "province": province, "type": target_type,
             "p50": predicted,
-            "p10": np.maximum(p10, 0), "p90": np.maximum(p90, 0),
+            "p10": p10 if self._allow_negative(target_type) else np.maximum(p10, 0),
+            "p90": p90 if self._allow_negative(target_type) else np.maximum(p90, 0),
             "model_version": "v1",
         })
         return result
+
+    def _calibrate_intervals(self, ensemble: pd.DataFrame,
+                             history: pd.DataFrame,
+                             province: str, target_type: str) -> pd.DataFrame:
+        """自适应区间校准: 历史残差分位数 + 分布偏移缓冲."""
+        try:
+            if "value" not in history.columns or len(history) < 96:
+                return ensemble
+
+            try:
+                models = self.trainer.load_quantile_models(province, target_type)
+                feature_names = list(models.values())[0][1] if models else []
+            except Exception as e:
+                logger.warning("校准阶段加载分位数模型失败 (%s/%s): %s", province, target_type, e)
+                return ensemble
+
+            if not feature_names:
+                return ensemble
+
+            recent = history.tail(672).copy()
+            if "value" not in recent.columns or len(recent) < 96:
+                return ensemble
+
+            for fn in feature_names:
+                if fn not in recent.columns:
+                    recent[fn] = 0.0
+
+            X_hist = recent[feature_names].values
+            actual = recent["value"].values
+
+            p50_m, _ = models.get("p50", (None, None))
+            if p50_m is None:
+                return ensemble
+
+            hist_p50 = p50_m.predict(X_hist)
+
+            # ── 相对残差 (避免绝对值受量级影响) ──
+            denom = np.maximum(np.abs(hist_p50), 1.0)
+            rel_residuals = np.abs(actual - hist_p50) / denom
+
+            target_quantile = 0.80
+            sigma_rel = float(np.quantile(rel_residuals, target_quantile))
+            sigma_rel = max(sigma_rel, 0.02)
+
+            # 分布偏移缓冲
+            sigma_rel *= 1.3
+
+            # ── 应用: 相对于 P50 缩放的宽度 ──
+            p50 = np.maximum(ensemble["p50"].values, 1.0)
+            model_lo = ensemble["p50"].values - ensemble["p10"].values
+            model_hi = ensemble["p90"].values - ensemble["p50"].values
+
+            # 残差驱动的宽度
+            cal_lo = sigma_rel * p50
+            cal_hi = sigma_rel * p50
+
+            # 混合: 模型不对称性 40% + 残差宽度 60%
+            final_lo = 0.4 * model_lo + 0.6 * cal_lo
+            final_hi = 0.4 * model_hi + 0.6 * cal_hi
+
+            # 上限: 宽度不超过 P50 的 2x
+            cap = p50 * 2.0
+            final_lo = np.minimum(final_lo, cap)
+            final_hi = np.minimum(final_hi, cap)
+
+            allow_neg = self._allow_negative(target_type)
+            raw_p10 = ensemble["p50"].values - final_lo
+            raw_p90 = ensemble["p50"].values + final_hi
+            ensemble["p10"] = raw_p10 if allow_neg else np.maximum(raw_p10, 0)
+            ensemble["p90"] = raw_p90 if allow_neg else np.maximum(raw_p90, 0)
+        except Exception as e:
+            logger.warning("区间校准失败 (%s/%s): %s", province, target_type, e)
+
+        return ensemble

@@ -149,7 +149,7 @@ class FileSource(DataSource):
 
     # ── Features ──
 
-    def save_features(self, df: pd.DataFrame) -> int:
+    def save_features(self, df: pd.DataFrame, replace: bool = False) -> int:
         if df.empty:
             return 0
         date_str = datetime.now().strftime("%Y%m%d")
@@ -158,14 +158,29 @@ class FileSource(DataSource):
                 self.base_dir, "features",
                 f"{province}_{dtype}_{date_str}.parquet"
             )
-            if os.path.exists(path):
+            if not replace and os.path.exists(path):
                 existing = pd.read_parquet(path)
-                group = pd.concat([existing, group]).drop_duplicates(subset=["dt"]).sort_values("dt")
+                # 新数据优先——新列覆盖旧 NaN
+                group = pd.concat([group, existing]).drop_duplicates(subset=["dt"], keep="first").sort_values("dt")
             group.to_parquet(path, index=False)
         return len(df)
 
+    def clear_features(self, provinces: list = None):
+        import glob
+        if provinces is None:
+            pattern = os.path.join(self.base_dir, "features", "*.parquet")
+            files = glob.glob(pattern)
+        else:
+            files = []
+            for p in provinces:
+                files.extend(glob.glob(os.path.join(
+                    self.base_dir, "features", f"{p}_*.parquet"
+                )))
+        for f in files:
+            os.remove(f)
+
     def load_features(self, province: str, data_type: str,
-                      start_date: str, end_date: str) -> pd.DataFrame:
+                      start_date: str = None, end_date: str = None) -> pd.DataFrame:
         import glob
         pattern = os.path.join(self.base_dir, "features", f"{province}_{data_type}_*.parquet")
         files = sorted(glob.glob(pattern))
@@ -177,10 +192,11 @@ class FileSource(DataSource):
             df = pd.read_parquet(f)
             if "dt" in df.columns:
                 df["dt"] = pd.to_datetime(df["dt"])
-            start_dt = pd.to_datetime(start_date)
-            end_dt = pd.to_datetime(end_date)
-            mask = (df["dt"] >= start_dt) & (df["dt"] < end_dt)
-            frames.append(df[mask])
+            if start_date is not None or end_date is not None:
+                start_dt = pd.to_datetime(start_date or "2000-01-01")
+                end_dt = pd.to_datetime(end_date or "2100-01-01")
+                df = df[(df["dt"] >= start_dt) & (df["dt"] < end_dt)]
+            frames.append(df)
 
         if not frames:
             return pd.DataFrame()
@@ -257,6 +273,9 @@ class MemorySource(DataSource):
     def setup(self):
         pass
 
+    def clear_features(self, provinces: list = None):
+        pass
+
     def set_raw(self, df: pd.DataFrame, province: str, data_type: str):
         self._raw[f"{province}_{data_type}"] = df.copy()
 
@@ -279,14 +298,17 @@ class MemorySource(DataSource):
         return len(df)
 
     def load_features(self, province: str, data_type: str,
-                      start_date: str, end_date: str) -> pd.DataFrame:
+                      start_date: str = None, end_date: str = None) -> pd.DataFrame:
         key = f"{province}_{data_type}"
         df = self._features.get(key, pd.DataFrame())
         if df.empty:
             return df
         df["dt"] = pd.to_datetime(df["dt"])
-        mask = (df["dt"] >= pd.to_datetime(start_date)) & (df["dt"] < pd.to_datetime(end_date))
-        return df[mask].sort_values("dt").reset_index(drop=True)
+        if start_date is not None or end_date is not None:
+            start_dt = pd.to_datetime(start_date or "2000-01-01")
+            end_dt = pd.to_datetime(end_date or "2100-01-01")
+            df = df[(df["dt"] >= start_dt) & (df["dt"] < end_dt)]
+        return df.sort_values("dt").reset_index(drop=True)
 
     def save_predictions(self, df: pd.DataFrame) -> int:
         date_str = datetime.now().strftime("%Y%m%d")

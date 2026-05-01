@@ -4,7 +4,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
-from scripts.core.config import get_provinces, get_types, load_config
+from scripts.core.config import get_provinces, get_types, load_config, validate_province_and_type
 from scripts.core.data_source import FileSource, MemorySource
 from scripts.data.features import FeatureStore, FeatureEngineer
 from scripts.ml.trainer import Trainer
@@ -56,6 +56,11 @@ class Orchestrator:
 
         provinces = [province] if province else get_provinces()
 
+        # 清理旧特征文件，避免与新列冲突
+        self.store.source.clear_features(provinces)
+
+        # 第一遍: 按 (province, type) 构建独立特征
+        built: Dict[str, pd.DataFrame] = {}
         for p in provinces:
             for t in get_types():
                 logger.info(f"构建特征: {p}/{t} ...")
@@ -65,14 +70,30 @@ class Orchestrator:
                     continue
 
                 features = self.engineer.build_features_from_raw(raw)
-                # build_features_from_raw 自动处理 CSV 中已有的所有列:
-                # 气象 → CDD/HDD/THI 等, 日历 → is_holiday/bridge_day 等, 周期 → sin/cos 编码
+                built[f"{p}/{t}"] = features
 
-                count = self.store.insert_features(features)
-                logger.info(f"  {p}/{t}: 写入 {count} 行")
+        # 第二遍: 同一省份多个类型 → 交叉注入
+        for p in provinces:
+            p_types = [t for t in get_types() if f"{p}/{t}" in built]
+            if len(p_types) < 2:
+                continue
+            logger.info(f"交叉特征: {p} ({', '.join(p_types)})")
+            for t in p_types:
+                other_types = [ot for ot in p_types if ot != t]
+                for ot in other_types:
+                    built[f"{p}/{t}"] = self.engineer.add_cross_type_features(
+                        built[f"{p}/{t}"], built[f"{p}/{ot}"], other_type=ot,
+                    )
+
+        # 第三遍: 写入
+        for key, features in built.items():
+            p, t = key.split("/")
+            count = self.store.insert_features(features)
+            logger.info(f"  {p}/{t}: 写入 {count} 行")
 
     def predict(self, province: str, target_type: str,
                 horizon_hours: int = 24) -> Dict:
+        validate_province_and_type(province, target_type)
         logger.info(f"预测: {province}/{target_type}, {horizon_hours}h")
 
         # 预测前先跑轻量回测，检查模型健康度
@@ -95,8 +116,8 @@ class Orchestrator:
                     health = {"mape": round(mape, 4), "status": "ok" if mape < 0.05 else "degraded"}
                     if health["status"] == "degraded":
                         logger.warning(f"模型精度退化 MAPE={mape:.2%}，建议触发 /improve")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("健康检查失败 (%s/%s): %s", province, target_type, e)
 
         df = self.predictor.predict(province, target_type, horizon_hours)
         result = {
@@ -264,16 +285,12 @@ class Orchestrator:
         }
 
     def _scan_available(self) -> list:
-        """返回有数据的 (province, type) 列表."""
-        end = datetime.now()
-        start = end - timedelta(days=90)
+        """返回有数据的 (province, type) 列表。扫描全量数据，不做日期截断。"""
         available = []
         for province in get_provinces():
             for target_type in get_types():
                 df = self.store.load_features(
-                    province, target_type,
-                    start.strftime("%Y-%m-%d"),
-                    (end + timedelta(days=1)).strftime("%Y-%m-%d"),
+                    province, target_type, None, None,
                 )
                 if not df.empty and len(df) >= 96:
                     available.append((province, target_type))
@@ -285,16 +302,12 @@ class Orchestrator:
             logger.warning("无可用数据，跳过训练")
             return
 
-        logger.info(f"扫描到 {len(available)} 组有数据的 (province, type)，开始训练...")
-        end = datetime.now()
-        start = end - timedelta(days=90)
+        logger.info(f"扫描到 {len(available)} 组有数据的 (province, type)，开始全量训练...")
 
         for province, target_type in available:
             logger.info(f"训练: {province}/{target_type}")
             df = self.store.load_features(
-                province, target_type,
-                start.strftime("%Y-%m-%d"),
-                (end + timedelta(days=1)).strftime("%Y-%m-%d"),
+                province, target_type, None, None,
             )
             result = self.trainer.train(df, province, target_type)
             logger.info(
@@ -306,6 +319,7 @@ class Orchestrator:
 
     def validate_data(self, province: str, target_type: str) -> Dict:
         """数据校验: 检查缺失率、时间连续性、类型正确性."""
+        validate_province_and_type(province, target_type)
         end = datetime.now()
         start = end - timedelta(days=365)
         df = self.store.load_raw_data(province, target_type,

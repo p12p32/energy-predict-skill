@@ -56,4 +56,14 @@ def get_improver_config() -> Dict[str, Any]:
     return _CONFIG.get("improver", {})
 
 
+def validate_province_and_type(province: str, target_type: str) -> None:
+    """校验 province 和 target_type 是否在合法范围内，非法则抛 ValueError."""
+    valid_provinces = get_provinces()
+    valid_types = get_types()
+    if province not in valid_provinces:
+        raise ValueError(f"未知省份 '{province}'，合法值: {valid_provinces}")
+    if target_type not in valid_types:
+        raise ValueError(f"未知类型 '{target_type}'，合法值: {valid_types}")
+
+
 load_config()

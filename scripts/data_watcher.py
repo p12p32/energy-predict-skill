@@ -8,6 +8,7 @@
   - doris:  轮询 Doris 表, 检测新记录
   - api:    定时拉取 HTTP API 数据
 """
+import fcntl
 import os
 import json
 import time
@@ -43,14 +44,22 @@ class DataWatcher:
     def _load_state(self) -> Dict:
         if os.path.exists(self._state_file):
             with open(self._state_file) as f:
-                return json.load(f)
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                try:
+                    return json.load(f)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         return {"last_processed": {}, "last_doris_max_dt": {}}
 
     def _save_state(self):
         os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
         self._state["updated"] = datetime.now().isoformat()
         with open(self._state_file, "w") as f:
-            json.dump(self._state, f, indent=2)
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                json.dump(self._state, f, indent=2)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
     # ================================================================
     # File: 监控 CSV 目录
@@ -203,7 +212,8 @@ class DataWatcher:
             start = raw["dt"].min().strftime("%Y-%m-%d")
             end = (raw["dt"].max() + timedelta(days=1)).strftime("%Y-%m-%d")
             weather = self.fetcher.fetch_weather(province, start, end, mode="historical")
-        except Exception:
+        except Exception as e:
+            logger.warning("气象数据获取失败 (%s/%s): %s", province, dtype, e)
             weather = pd.DataFrame()
 
         features = self.engineer.build_features_from_raw(raw)
