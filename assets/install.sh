@@ -6,7 +6,7 @@ set -e
 echo "=== 电力预测 Skill 安装 ==="
 echo ""
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 # 自动探测 Python / Pip
 PYTHON=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || echo "python3")
@@ -79,17 +79,17 @@ if ! grep -q "ENERGY_HOME" "$RC_FILE" 2>/dev/null; then
   echo "export ENERGY_HOME=\"$SCRIPT_DIR\"" >> "$RC_FILE"
 fi
 if ! grep -q "energy-predict" "$RC_FILE" 2>/dev/null; then
-  echo "alias energy-predict=\"$SCRIPT_DIR/energy-predict\"" >> "$RC_FILE"
+  echo "alias energy-predict=\"$SCRIPT_DIR/assets/energy-predict\"" >> "$RC_FILE"
 fi
 echo "  已写入: $RC_FILE"
 
 # ── 3. 验证 ──
 echo ""
 echo "[3/3] 验证安装..."
-chmod +x "$SCRIPT_DIR/energy-predict"
+chmod +x "$SCRIPT_DIR/assets/energy-predict"
 export ENERGY_HOME="$SCRIPT_DIR"
 
-$PYTHON -c "from src.core.config import load_config; load_config(); print('  ✅ 配置加载')" 2>/dev/null || echo "  ⚠ 配置加载失败 (检查 config.yaml)"
+$PYTHON -c "from scripts.core.config import load_config; load_config(); print('  ✅ 配置加载')" 2>/dev/null || echo "  ⚠ 配置加载失败 (检查 config.yaml)"
 $PYTHON -c "import pandas, numpy; print(f'  ✅ pandas {pandas.__version__}, numpy {numpy.__version__}')" 2>/dev/null || echo "  ⚠ pandas/numpy 未安装"
 $PYTHON -c "import lightgbm; print(f'  ✅ LightGBM {lightgbm.__version__}')" 2>/dev/null || echo "  ⚠ LightGBM 未安装 (轻量模式, 无训练功能)"
 $PYTHON -c "import requests; print('  ✅ requests OK')" 2>/dev/null || echo "  ⚠ requests 未安装"

@@ -1,6 +1,6 @@
 """tests/test_analyzer.py"""
 import pytest
-from src.evolve.analyzer import Analyzer
+from scripts.evolve.analyzer import Analyzer
 
 
 class TestAnalyzer:

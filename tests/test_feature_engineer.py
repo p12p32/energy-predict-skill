@@ -7,7 +7,7 @@ from datetime import datetime
 
 class TestFeatureEngineer:
     def setup_method(self):
-        from src.data.features import FeatureEngineer
+        from scripts.data.features import FeatureEngineer
         self.engineer = FeatureEngineer()
         dates = pd.date_range("2025-01-01", periods=500, freq="15min")
         raw = pd.DataFrame({
@@ -52,7 +52,7 @@ class TestFeatureEngineer:
 
 class TestWeatherFeatures:
     def test_cdd_hdd(self):
-        from src.data.weather_features import WeatherFeatureEngineer
+        from scripts.data.weather_features import WeatherFeatureEngineer
         wfe = WeatherFeatureEngineer()
         df = pd.DataFrame({"temperature": [30, 10, 20, 35]})
         result = wfe.transform(df)
@@ -62,7 +62,7 @@ class TestWeatherFeatures:
         assert result["HDD"].iloc[1] == 8.0  # 18 - 10
 
     def test_thi(self):
-        from src.data.weather_features import WeatherFeatureEngineer
+        from scripts.data.weather_features import WeatherFeatureEngineer
         wfe = WeatherFeatureEngineer()
         df = pd.DataFrame({"temperature": [30, 20], "humidity": [80, 50]})
         result = wfe.transform(df)

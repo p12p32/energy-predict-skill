@@ -6,10 +6,10 @@ import pandas as pd
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
-from src.core.data_source import DataSource, FileSource
-from src.ml.trainer import Trainer
-from src.evolve.backtester import Backtester
-from src.ml.executor import StrategyExecutor
+from scripts.core.data_source import DataSource, FileSource
+from scripts.ml.trainer import Trainer
+from scripts.evolve.backtester import Backtester
+from scripts.ml.executor import StrategyExecutor
 
 
 class Improver:

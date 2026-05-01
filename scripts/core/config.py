@@ -13,7 +13,7 @@ def load_config(config_path: str = None) -> Dict[str, Any]:
         return _CONFIG
 
     if config_path is None:
-        config_path = os.path.join(_SKILL_HOME, "config.yaml")
+        config_path = os.path.join(_SKILL_HOME, "assets", "config.yaml")
 
     with open(config_path, "r", encoding="utf-8") as f:
         _CONFIG = yaml.safe_load(f)

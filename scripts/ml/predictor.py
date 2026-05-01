@@ -4,12 +4,12 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict
 
-from src.ml.trainer import Trainer
-from src.ml.trend import TrendModel
-from src.ml.error_correction import ErrorCorrectionModel
-from src.data.features import FeatureStore
-from src.data.fetcher import DataFetcher
-from src.core.config import load_config
+from scripts.ml.trainer import Trainer
+from scripts.ml.trend import TrendModel
+from scripts.ml.error_correction import ErrorCorrectionModel
+from scripts.data.features import FeatureStore
+from scripts.data.fetcher import DataFetcher
+from scripts.core.config import load_config
 
 
 class Predictor:
@@ -168,7 +168,7 @@ class Predictor:
             rows.append(row)
         future_df = pd.DataFrame(rows)
 
-        from src.data.holidays import add_holiday_features, add_cyclical_features
+        from scripts.data.holidays import add_holiday_features, add_cyclical_features
         future_df = add_holiday_features(future_df)
         future_df = add_cyclical_features(future_df)
         future_df["quality_flag"] = 0

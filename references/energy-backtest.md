@@ -1,6 +1,6 @@
 ---
 name: energy-backtest
-description: 回测验证层 Skill — 实时验证/回塑验证/误差诊断。被主 Skill 调用。
+description: Use when validating model accuracy, running backtests, or diagnosing prediction degradation with seasonal and hourly error decomposition.
 ---
 
 ## 工作空间
@@ -11,7 +11,7 @@ description: 回测验证层 Skill — 实时验证/回塑验证/误差诊断。
 
 ```bash
 cd $ENERGY_HOME && python3 -c "
-from src.orchestrator import Orchestrator
+from scripts.orchestrator import Orchestrator
 import json
 o = Orchestrator()
 result = o.run_validation_cycle('广东', 'load')
@@ -23,7 +23,7 @@ print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 
 ```bash
 cd $ENERGY_HOME && python3 -c "
-from src.orchestrator import Orchestrator
+from scripts.orchestrator import Orchestrator
 o = Orchestrator()
 result = o.run_backtest_cycle('广东', 'load')
 print(f\"MAPE: {result.get('mape')}\")

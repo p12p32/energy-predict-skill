@@ -20,13 +20,13 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from src.core.data_source import MemorySource
-from src.data.features import FeatureEngineer
-from src.ml.trainer import Trainer
-from src.evolve.backtester import Backtester
-from src.evolve.validator import Validator
-from src.evolve.analyzer import Analyzer
-from src.evolve.improver import Improver
+from scripts.core.data_source import MemorySource
+from scripts.data.features import FeatureEngineer
+from scripts.ml.trainer import Trainer
+from scripts.evolve.backtester import Backtester
+from scripts.evolve.validator import Validator
+from scripts.evolve.analyzer import Analyzer
+from scripts.evolve.improver import Improver
 
 
 # ============================================================

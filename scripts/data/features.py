@@ -2,9 +2,9 @@
 import pandas as pd
 import numpy as np
 from typing import Optional, List
-from src.data.holidays import add_holiday_features, add_cyclical_features, add_deep_calendar_features
-from src.data.quality import DataQuality
-from src.data.weather_features import WeatherFeatureEngineer
+from scripts.data.holidays import add_holiday_features, add_cyclical_features, add_deep_calendar_features
+from scripts.data.quality import DataQuality
+from scripts.data.weather_features import WeatherFeatureEngineer
 
 PREDICTION_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS energy_predictions (
@@ -154,7 +154,7 @@ class FeatureStore:
 
     def __init__(self, source=None):
         if source is None:
-            from src.core.data_source import FileSource
+            from scripts.core.data_source import FileSource
             source = FileSource()
         self.source = source
 

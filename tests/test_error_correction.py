@@ -1,7 +1,7 @@
 """tests/test_error_correction.py"""
 import pytest
 import numpy as np
-from src.ml.error_correction import ErrorCorrectionModel
+from scripts.ml.error_correction import ErrorCorrectionModel
 
 
 class TestErrorCorrectionModel:

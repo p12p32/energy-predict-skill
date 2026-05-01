@@ -1,6 +1,6 @@
 ---
 name: energy-improve
-description: 自我优化层 Skill — N假说竞技场+策略知识库。被主 Skill 调用。
+description: Use when model MAPE degrades or systematic bias is detected — hypothesis generation, arena testing, and strategy knowledge base update.
 ---
 
 ## 工作空间
@@ -11,7 +11,7 @@ description: 自我优化层 Skill — N假说竞技场+策略知识库。被主
 
 ```bash
 cd $ENERGY_HOME && python3 -c "
-from src.orchestrator import Orchestrator
+from scripts.orchestrator import Orchestrator
 import json
 o = Orchestrator()
 result = o.run_validation_cycle('广东', 'load')
@@ -23,8 +23,8 @@ print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 
 ```bash
 cd $ENERGY_HOME && python3 -c "
-from src.evolve.improver import Improver
-from src.core.data_source import FileSource
+from scripts.evolve.improver import Improver
+from scripts.core.data_source import FileSource
 imp = Improver(data_source=FileSource())
 knowledge = imp.query_knowledge('summer')
 if knowledge:

@@ -1,6 +1,6 @@
 ---
 name: energy-predict-exec
-description: 预测执行层 Skill — 集成预测+趋势+分位数。被主 Skill 调用。
+description: Use when executing electricity predictions — runs LightGBM quantile models, trend ensemble, and error correction for provincial power data.
 ---
 
 ## 工作空间
@@ -11,7 +11,7 @@ description: 预测执行层 Skill — 集成预测+趋势+分位数。被主 Sk
 
 ```bash
 cd $ENERGY_HOME && python3 -c "
-from src.orchestrator import Orchestrator
+from scripts.orchestrator import Orchestrator
 o = Orchestrator()
 result = o.predict('广东', 'load', 24)
 for r in result.get('sample', []):
@@ -25,7 +25,7 @@ for r in result.get('sample', []):
 
 ```bash
 cd $ENERGY_HOME && python3 -c "
-from src.orchestrator import Orchestrator
+from scripts.orchestrator import Orchestrator
 print(Orchestrator().chart('广东', 'load', 24))
 "
 ```
@@ -34,7 +34,7 @@ print(Orchestrator().chart('广东', 'load', 24))
 
 ```bash
 cd $ENERGY_HOME && python3 -c "
-from src.orchestrator import Orchestrator
+from scripts.orchestrator import Orchestrator
 print(Orchestrator().export('广东', 'load', fmt='csv'))
 "
 ```

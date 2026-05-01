@@ -4,16 +4,16 @@ import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
-from src.core.config import get_provinces, get_types, load_config
-from src.core.data_source import FileSource, MemorySource
-from src.data.features import FeatureStore, FeatureEngineer
-from src.data.fetcher import DataFetcher
-from src.ml.trainer import Trainer
-from src.ml.predictor import Predictor
-from src.evolve.validator import Validator
-from src.evolve.backtester import Backtester
-from src.evolve.analyzer import Analyzer
-from src.evolve.improver import Improver
+from scripts.core.config import get_provinces, get_types, load_config
+from scripts.core.data_source import FileSource, MemorySource
+from scripts.data.features import FeatureStore, FeatureEngineer
+from scripts.data.fetcher import DataFetcher
+from scripts.ml.trainer import Trainer
+from scripts.ml.predictor import Predictor
+from scripts.evolve.validator import Validator
+from scripts.evolve.backtester import Backtester
+from scripts.evolve.analyzer import Analyzer
+from scripts.evolve.improver import Improver
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -25,7 +25,7 @@ class Orchestrator:
         cfg = load_config()
         ds_type = cfg.get("data_source", "file")
         if ds_type == "doris":
-            from src.core.db import DorisDB
+            from scripts.core.db import DorisDB
             self.source = DorisDB()
         elif ds_type == "memory":
             self.source = MemorySource()

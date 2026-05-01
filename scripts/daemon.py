@@ -10,9 +10,9 @@ import time
 from datetime import datetime, timedelta
 from typing import Dict, List
 
-from src.orchestrator import Orchestrator
-from src.data_watcher import DataWatcher
-from src.core.config import get_provinces, get_types, load_config
+from scripts.orchestrator import Orchestrator
+from scripts.data_watcher import DataWatcher
+from scripts.core.config import get_provinces, get_types, load_config
 
 logging.basicConfig(
     level=logging.INFO,

@@ -6,7 +6,7 @@
 
 ```bash
 git clone <repo-url> && cd energy-predict-skill
-bash install.sh
+bash assets/install.sh
 source ~/.zshrc
 ```
 
@@ -48,4 +48,4 @@ dt,province,type,value,price
 
 ## 作为 OpenCode Skill
 
-将 `skills/energy-predict.md` 复制到你的 OpenCode skills 目录即可自动激活。
+将 `SKILL.md` 复制到你的 OpenCode skills 目录即可自动激活。

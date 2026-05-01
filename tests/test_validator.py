@@ -8,7 +8,7 @@ from datetime import datetime
 class TestValidator:
     def setup_method(self):
         try:
-            from src.evolve.validator import Validator
+            from scripts.evolve.validator import Validator
             self.validator = Validator()
         except (FileNotFoundError, KeyError) as e:
             pytest.skip(f"Config not available: {e}")

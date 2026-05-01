@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 class TestFileSource:
     def setup_method(self):
         self.tmpdir = tempfile.mkdtemp()
-        from src.core.data_source import FileSource
+        from scripts.core.data_source import FileSource
         self.source = FileSource(base_dir=self.tmpdir)
 
         dates = pd.date_range("2025-01-01", periods=200, freq="15min")
@@ -64,7 +64,7 @@ class TestFileSource:
 
 class TestMemorySource:
     def setup_method(self):
-        from src.core.data_source import MemorySource
+        from scripts.core.data_source import MemorySource
         self.source = MemorySource()
 
     def test_set_and_load_raw(self):

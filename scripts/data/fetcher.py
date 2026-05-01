@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 import requests
 import pandas as pd
-from src.core.config import get_province_coords
+from scripts.core.config import get_province_coords
 
 OPEN_METEO_HISTORICAL = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"

@@ -2,7 +2,7 @@
 # energy-predict — 电力预测 Skill 命令行入口
 # 用法: energy-predict {import|predict|status|explain|benchmark|daemon}
 
-export ENERGY_HOME="${ENERGY_HOME:-$(cd "$(dirname "$0")" && pwd)}"
+export ENERGY_HOME="${ENERGY_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"
 cd "$ENERGY_HOME"
 
 # 自动探测 Python (跨平台: Windows/macOS/Linux)
@@ -11,7 +11,7 @@ PYTHON=$(command -v python 2>/dev/null || command -v python3 2>/dev/null || comm
 case "$1" in
   import)
     $PYTHON -c "
-from src.core.data_source import FileSource
+from scripts.core.data_source import FileSource
 fs = FileSource()
 result = fs.import_csv('$2')
 print(result)
@@ -20,7 +20,7 @@ print(result)
 
   predict)
     $PYTHON -c "
-from src.orchestrator import Orchestrator
+from scripts.orchestrator import Orchestrator
 import json
 o = Orchestrator()
 result = o.predict('${2:-广东}', '${3:-load}', ${4:-24})
@@ -48,7 +48,7 @@ for k, v in sorted(r.items()):
 
   explain)
     $PYTHON -c "
-from src.orchestrator import Orchestrator
+from scripts.orchestrator import Orchestrator
 o = Orchestrator()
 result = o.explain('${2:-广东}', '${3:-load}')
 for f in result.get('feature_importance', [])[:10]:
@@ -61,12 +61,12 @@ for f in result.get('feature_importance', [])[:10]:
     ;;
 
   daemon)
-    $PYTHON src/daemon.py --interval "${2:-15}"
+    $PYTHON scripts/daemon.py --interval "${2:-15}"
     ;;
 
   export)
     $PYTHON -c "
-from src.orchestrator import Orchestrator
+from scripts.orchestrator import Orchestrator
 o = Orchestrator()
 result = o.export('${2:-广东}', '${3:-load}', fmt='${4:-json}')
 print(result)

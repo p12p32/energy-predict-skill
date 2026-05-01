@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 class TestTrainer:
     def setup_method(self):
         self.tmpdir = tempfile.mkdtemp()
-        from src.ml.trainer import Trainer
+        from scripts.ml.trainer import Trainer
         self.trainer = Trainer(model_dir=self.tmpdir)
 
         dates = pd.date_range("2025-01-01", periods=2000, freq="15min")

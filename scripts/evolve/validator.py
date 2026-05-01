@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 from typing import Dict, List, Optional
-from src.core.config import get_validator_config
+from scripts.core.config import get_validator_config
 
 
 class Validator:

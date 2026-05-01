@@ -17,10 +17,10 @@ from typing import Dict, List, Optional, Callable
 
 import pandas as pd
 
-from src.core.data_source import FileSource, DataSource
-from src.core.config import load_config, get_provinces, get_types
-from src.data.features import FeatureStore, FeatureEngineer
-from src.data.fetcher import DataFetcher
+from scripts.core.data_source import FileSource, DataSource
+from scripts.core.config import load_config, get_provinces, get_types
+from scripts.data.features import FeatureStore, FeatureEngineer
+from scripts.data.fetcher import DataFetcher
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +111,7 @@ class DataWatcher:
         Returns: 处理的数据批次数量
         """
         try:
-            from src.core.db import DorisDB
+            from scripts.core.db import DorisDB
             db = DorisDB()
         except Exception as e:
             logger.warning(f"Doris 连接失败: {e}")
