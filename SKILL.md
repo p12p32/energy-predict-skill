@@ -7,23 +7,33 @@ description: Use when users ask for electricity load forecasting, power output p
 
 LightGBM 分位数回归 + 自进化闭环。覆盖 7 省 × 3 类型（出力/负荷/电价）。
 
-## 安装（必读）
+## Setup（自动）
 
-> **仅复制 SKILL.md 无法使用。** 本 Skill 依赖 `scripts/` 和 `assets/` 目录中的 Python 代码和配置文件，两者必须与 SKILL.md 在同一目录下。
+**Before any command, verify the environment. If not set up, do it automatically:**
 
 ```bash
-git clone https://github.com/p12p32/energy-predict-skill.git
-cd energy-predict-skill
-bash assets/install.sh
-source ~/.zshrc  # 或 ~/.bashrc
+# Check: are we in a proper clone?
+if [ ! -f "scripts/core/config.py" ]; then
+  echo "❌ 缺少 scripts/ 目录。请先 git clone 整个仓库，不能只复制 SKILL.md："
+  echo "   git clone https://github.com/p12p32/energy-predict-skill.git"
+  echo "   将整个 energy-predict-skill/ 目录作为 skill 安装"
+  exit 1
+fi
+
+# Auto-install if not done yet
+if [ -z "$ENERGY_HOME" ]; then
+  echo "首次使用，自动安装依赖..."
+  bash assets/install.sh
+  export ENERGY_HOME="$(pwd)"
+  echo "安装完成"
+fi
 ```
 
-安装后验证：
-```bash
-ls scripts/core/config.py && echo "✅ 安装正确" || echo "❌ 缺少 scripts/，请 git clone 整个仓库"
-```
+> 此 check 集成到每个命令前执行。Skill 目录已包含 `scripts/` + `assets/`，安装脚本自动安装 Python 依赖并配置环境变量。
 
 ## Quick Reference
+
+**每个命令执行前，先跑 Setup 自检。** 如果 `$ENERGY_HOME` 未设置或 `scripts/` 缺失，自动执行安装或提示 git clone。
 
 | 命令 | 用途 |
 |------|------|
