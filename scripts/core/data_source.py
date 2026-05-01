@@ -116,7 +116,7 @@ class FileSource(DataSource):
         return df[mask].sort_values("dt").reset_index(drop=True)
 
     def import_csv(self, filepath: str) -> Dict:
-        """导入 CSV 文件到 raw 目录，完成后诊断维度覆盖."""
+        """导入 CSV 到 raw 目录。返回列信息供 AI 自行判断维度覆盖."""
         df = pd.read_csv(filepath)
 
         required = ["dt"]
@@ -136,67 +136,15 @@ class FileSource(DataSource):
                 output_path = os.path.join(self.base_dir, "raw", f"{province}_{dtype}.csv")
             group.to_csv(output_path, index=False)
 
+        # 哑报告：只管列名，不做任何维度假定
+        auto_cols = {"dt", "province", "type", "value"}
+        extra_cols = [c for c in df.columns if c not in auto_cols]
+
         return {
             "status": "ok",
             "rows": len(df),
-            "file": filepath,
-            "diagnosis": self._diagnose_columns(df),
-        }
-
-    def _diagnose_columns(self, df: pd.DataFrame) -> Dict:
-        """诊断 CSV 列的维度覆盖，返回缺失维度及获取建议."""
-        cols = set(df.columns)
-
-        weather_cols = ["temperature", "humidity", "wind_speed",
-                        "solar_radiation", "precipitation", "pressure"]
-        economic_cols = ["coal_price", "carbon_price", "price"]
-
-        present_weather = [c for c in weather_cols if c in cols]
-        missing_weather = [c for c in weather_cols if c not in cols]
-        present_economic = [c for c in economic_cols if c in cols]
-        missing_economic = [c for c in economic_cols if c not in cols]
-
-        # 自动维度: 系统从 dt 列自动计算，无需外部数据
-        auto_dimensions = [
-            "lag (滞后特征 — 从 value 列自动推导)",
-            "calendar (小时/星期/季节/节假日 — 从 dt 列自动推导)",
-            "cyclical (sin/cos 周期编码 — 自动计算)",
-        ]
-
-        suggestions = []
-        if missing_weather:
-            suggestions.append({
-                "dimension": "气象",
-                "missing": missing_weather,
-                "present": present_weather if present_weather else ["(无)"],
-                "how_to_get": (
-                    "可用 tools/python 执行: "
-                    "python3 -c \"from scripts.data.fetcher import DataFetcher; "
-                    "df = DataFetcher().fetch_weather_for_all_provinces('YYYY-MM-DD', 'YYYY-MM-DD'); "
-                    "df.to_csv('data/weather.csv', index=False)\"；"
-                    "或使用自己的气象 API / 数据源，写入 CSV 后重新 /import"
-                ),
-            })
-        if missing_economic:
-            suggestions.append({
-                "dimension": "经济",
-                "missing": missing_economic,
-                "present": present_economic if present_economic else ["(无)"],
-                "how_to_get": (
-                    "煤价 → 搜索 '秦皇岛动力煤价格' + 爬取/手动录入；"
-                    "碳价 → 搜索 '全国碳排放权交易市场价格'；"
-                    "数据写入 CSV 后重新 /import"
-                ),
-            })
-
-        all_covered = not missing_weather and not missing_economic
-
-        return {
-            "auto_dimensions": auto_dimensions,
-            "missing_dimensions": suggestions,
-            "all_covered": all_covered,
-            "summary": "数据维度完整，可直接训练" if all_covered
-                       else f"缺失 {len(missing_weather) + len(missing_economic)} 个外部数据列，建议 AI 补全后重新导入",
+            "columns": list(df.columns),
+            "extra_columns": extra_cols,
         }
 
     # ── Features ──

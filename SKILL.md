@@ -169,26 +169,19 @@ for r in result.get('sample', []):
 
 ## /import <csv路径>
 
-导入后系统自动诊断维度覆盖，返回缺失项及获取建议：
+导入 CSV 后返回列清单。AI 自行对比"预测维度"章节判断覆盖：
 
 ```bash
-python3 -c "
-from scripts.core.data_source import FileSource
-import json
-result = FileSource().import_csv('data/my_data.csv')
-print(json.dumps(result['diagnosis'], ensure_ascii=False, indent=2))
-"
+python3 -c "from scripts.core.data_source import FileSource; import json; print(json.dumps(FileSource().import_csv('data/my_data.csv'), ensure_ascii=False))"
+# → {"status":"ok", "rows":1000, "columns":["dt","province","type","value"], "extra_columns":[]}
 ```
 
-**AI 看到诊断结果后，按需补全：**
+**AI 收到 columns 后，对照上方"预测维度"表格：**
+1. 气象列 (temperature/humidity/wind_speed/solar_radiation/precipitation/pressure) — 哪个缺？
+2. 经济列 (coal_price/carbon_price/price) — 哪个缺？
+3. 缺什么补什么，补全后重新 `/import`
 
-| 缺失维度 | 获取方式 |
-|----------|----------|
-| 气象 (temperature/humidity/...) | `python3 -c "from scripts.data.fetcher import DataFetcher; ..."` 调 Open-Meteo |
-| 煤价/碳价 | WebSearch 搜索公开数据 → 写入 CSV → 重新 /import |
-| 节假日 | 已内置覆盖 2023-2032，无需外部数据 |
-
-CSV 必需列：`dt, province, type, value`；可选列：`temperature, humidity, wind_speed, solar_radiation, precipitation, pressure, coal_price, carbon_price, price` 及任意自定义列。
+**可用工具：** `scripts/data/fetcher.py` 提供 Open-Meteo 气象数据获取。AI 也可使用自己的数据源。CSV 是唯一接口。
 
 ## /backtest <省份> <类型>
 
