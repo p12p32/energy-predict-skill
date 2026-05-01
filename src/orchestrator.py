@@ -3,6 +3,8 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
+import pandas as pd
+
 from src.core.config import get_provinces, get_types
 from src.core.data_source import FileSource
 from src.data.features import FeatureStore, FeatureEngineer

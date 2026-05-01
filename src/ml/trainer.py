@@ -167,8 +167,10 @@ class Trainer:
         if not versions:
             raise FileNotFoundError(f"未找到模型版本: {key}")
 
-        idx = version if version == -1 else min(version, len(versions) - 1)
-        p50_fname = versions[-(idx if idx == -1 else idx + 1)]
+        if version == -1:
+            p50_fname = versions[-1]
+        else:
+            p50_fname = versions[min(version, len(versions) - 1)]
         p10_fname = p50_fname.replace("p50_", "p10_")
         p90_fname = p50_fname.replace("p50_", "p90_")
 
