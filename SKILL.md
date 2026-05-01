@@ -169,13 +169,24 @@ for r in result.get('sample', []):
 
 ## /import <csv路径>
 
-**导入前，先根据"预测维度"主动搜集外部数据丰富 CSV：**
+导入后系统自动诊断维度覆盖，返回缺失项及获取建议：
 
 ```bash
-# 1. AI 搜集数据 → 构造含多维特征的 CSV → 写入文件
-# 2. 导入
-python3 -c "from scripts.core.data_source import FileSource; FileSource().import_csv('data/my_data.csv')"
+python3 -c "
+from scripts.core.data_source import FileSource
+import json
+result = FileSource().import_csv('data/my_data.csv')
+print(json.dumps(result['diagnosis'], ensure_ascii=False, indent=2))
+"
 ```
+
+**AI 看到诊断结果后，按需补全：**
+
+| 缺失维度 | 获取方式 |
+|----------|----------|
+| 气象 (temperature/humidity/...) | `python3 -c "from scripts.data.fetcher import DataFetcher; ..."` 调 Open-Meteo |
+| 煤价/碳价 | WebSearch 搜索公开数据 → 写入 CSV → 重新 /import |
+| 节假日 | 已内置覆盖 2023-2032，无需外部数据 |
 
 CSV 必需列：`dt, province, type, value`；可选列：`temperature, humidity, wind_speed, solar_radiation, precipitation, pressure, coal_price, carbon_price, price` 及任意自定义列。
 

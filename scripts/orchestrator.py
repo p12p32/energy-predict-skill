@@ -7,7 +7,6 @@ from typing import Dict, List, Optional
 from scripts.core.config import get_provinces, get_types, load_config
 from scripts.core.data_source import FileSource, MemorySource
 from scripts.data.features import FeatureStore, FeatureEngineer
-from scripts.data.fetcher import DataFetcher
 from scripts.ml.trainer import Trainer
 from scripts.ml.predictor import Predictor
 from scripts.evolve.validator import Validator
@@ -38,7 +37,6 @@ class Orchestrator:
         self.validator = Validator()
         self.analyzer = Analyzer()
         self.improver = Improver(self.source, self.trainer, self.backtester)
-        self.fetcher = DataFetcher()
         self.engineer = FeatureEngineer()
 
         self._validator_history: List[Dict] = []
