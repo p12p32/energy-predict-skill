@@ -76,14 +76,41 @@ class Orchestrator:
     def predict(self, province: str, target_type: str,
                 horizon_hours: int = 24) -> Dict:
         logger.info(f"预测: {province}/{target_type}, {horizon_hours}h")
+
+        # 预测前先跑轻量回测，检查模型健康度
+        health = None
+        try:
+            end = datetime.now()
+            start = end - timedelta(days=30)
+            features_df = self.store.load_features(
+                province, target_type,
+                start.strftime("%Y-%m-%d"),
+                (end + timedelta(days=1)).strftime("%Y-%m-%d"),
+            )
+            if not features_df.empty and len(features_df) >= 96 * 7:
+                bt = self.backtester.evaluate_model(
+                    features_df, train_window_days=7, test_window_hours=24,
+                    province=province, target_type=target_type,
+                )
+                mape = bt.get("overall_mape")
+                if mape is not None:
+                    health = {"mape": round(mape, 4), "status": "ok" if mape < 0.05 else "degraded"}
+                    if health["status"] == "degraded":
+                        logger.warning(f"模型精度退化 MAPE={mape:.2%}，建议触发 /improve")
+        except Exception:
+            pass
+
         df = self.predictor.predict(province, target_type, horizon_hours)
-        return {
+        result = {
             "province": province,
             "type": target_type,
             "horizon_hours": horizon_hours,
             "n_predictions": len(df),
             "sample": df.head(5)[["dt", "p50"]].to_dict("records") if not df.empty else [],
         }
+        if health is not None:
+            result["health"] = health
+        return result
 
     def run_validation_cycle(self, province: str,
                               target_type: str) -> Dict:

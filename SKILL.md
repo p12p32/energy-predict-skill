@@ -145,11 +145,20 @@ fi
 
 ## /predict <省份> <类型> <时间范围>
 
+每次预测前自动跑轻量回测，检查模型健康度。如果 MAPE > 5%，自动告警建议 `/improve`。
+
 ```bash
 cd $ENERGY_HOME && python3 -c "
 from scripts.orchestrator import Orchestrator
 o = Orchestrator()
 result = o.predict('广东', 'load', 24)
+# 模型健康检查
+if result.get('health'):
+    h = result['health']
+    print(f'模型精度: MAPE={h[\"mape\"]:.2%} ({h[\"status\"]})')
+    if h['status'] == 'degraded':
+        print('⚠ 精度退化，建议 /improve 广东 load')
+print()
 for r in result.get('sample', []):
     print(f\"{r['dt']}  P50={r['p50']:,.0f}\")
 "
