@@ -97,12 +97,14 @@ class Predictor:
                            province: str, target_type: str) -> pd.DataFrame:
         """用分位数模型做预测."""
         p10_model, feature_names = models.get("p10", (None, None))
-        p50_model, _ = models.get("p50", (None, None))
+        p50_model, p50_feature_names = models.get("p50", (None, None))
         p90_model, _ = models.get("p90", (None, None))
 
         if p50_model is None:
             raise ValueError("无 P50 模型")
 
+        if feature_names is None:
+            feature_names = p50_feature_names or []
         for fn in feature_names:
             if fn not in features_df.columns:
                 features_df[fn] = 0.0

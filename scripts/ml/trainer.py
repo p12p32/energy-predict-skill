@@ -59,8 +59,11 @@ class Trainer:
         """从 LightGBM 原生文本文件加载模型."""
         model = lgb.LGBMRegressor()
         booster = lgb.Booster(model_file=path)
+        n_features = booster.num_feature()
         model._Booster = booster
-        model._n_features = booster.num_feature()
+        model._n_features = n_features
+        model.n_features_in_ = n_features
+        model.fitted_ = True
         return model
 
     @staticmethod
@@ -251,8 +254,14 @@ class Trainer:
             p50_fname = versions[-1]
         else:
             p50_fname = versions[max(0, min(version, len(versions) - 1))]
-        p10_fname = p50_fname.replace("p50_", "p10_")
-        p90_fname = p50_fname.replace("p50_", "p90_")
+        # 仅当文件名包含 "p50_" 时说明是 quantile_train 训练的, 才有独立 P10/P90 文件
+        if "p50_" in p50_fname:
+            p10_fname = p50_fname.replace("p50_", "p10_")
+            p90_fname = p50_fname.replace("p50_", "p90_")
+        else:
+            # 单模型 (train()) → 无独立 P10/P90, 设空让下游回退
+            p10_fname = "__nonexistent__"
+            p90_fname = "__nonexistent__"
 
         province_dir = os.path.join(self.model_dir, province)
         feature_names = entry["feature_names"]
