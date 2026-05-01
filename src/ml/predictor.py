@@ -70,6 +70,9 @@ class Predictor:
         if p50_model is None:
             raise ValueError("无 P50 模型")
 
+        for fn in feature_names:
+            if fn not in features_df.columns:
+                features_df[fn] = 0.0
         X = features_df[feature_names].values
 
         result = pd.DataFrame({
@@ -117,10 +120,11 @@ class Predictor:
         last_row = history.iloc[-1].copy()
         last_value = last_row.get("value", 0)
         last_price = last_row.get("price", 0)
-        future_times = [
-            base_dt + timedelta(minutes=15 * i)
-            for i in range(1, horizon_steps + 1)
-        ]
+        future_times = pd.date_range(
+            start=base_dt + timedelta(minutes=15),
+            periods=horizon_steps,
+            freq="15min",
+        )
         rows = []
         for i, ft in enumerate(future_times):
             row = {
@@ -148,6 +152,16 @@ class Predictor:
             row["value_diff_7d"] = 0.0
             rows.append(row)
         future_df = pd.DataFrame(rows)
+
+        from src.data.holidays import add_holiday_features, add_cyclical_features
+        future_df = add_holiday_features(future_df)
+        future_df = add_cyclical_features(future_df)
+        future_df["quality_flag"] = 0
+        for col in ["temperature", "humidity", "wind_speed", "wind_direction",
+                     "solar_radiation", "precipitation", "pressure"]:
+            if col not in future_df.columns:
+                future_df[col] = history[col].mean() if col in history.columns else 0.0
+
         try:
             forecast_end = (base_dt + timedelta(days=8)).strftime("%Y-%m-%d")
             weather = self.fetcher.fetch_weather(
@@ -177,6 +191,9 @@ class Predictor:
                             feature_names: List[str], province: str,
                             target_type: str,
                             history: pd.DataFrame = None) -> pd.DataFrame:
+        for fn in feature_names:
+            if fn not in features_df.columns:
+                features_df[fn] = 0.0
         predict_features = features_df[feature_names].copy()
         predicted = model.predict(predict_features)
         residual_std = 0.05

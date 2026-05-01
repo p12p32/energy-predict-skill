@@ -1,5 +1,6 @@
 """orchestrator.py — 总调度器：管理循环 A/B/C"""
 import logging
+import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
