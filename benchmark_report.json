@@ -1,0 +1,38 @@
+{
+  "timestamp": "2026-05-01T09:19:55.369812",
+  "data_info": {
+    "n_rows": 30000,
+    "n_features": 51
+  },
+  "model_metrics": {
+    "mape": 0.0144,
+    "rmse": 2.24
+  },
+  "baselines": {
+    "永续(昨天同时刻)": 0.11650069801209667,
+    "上周同期": 0.152738991860292,
+    "历史均值": 0.2239247336780619
+  },
+  "best_baseline": {
+    "name": "永续(昨天同时刻)",
+    "mape": 0.11650069801209667
+  },
+  "improvement_vs_baseline": {
+    "absolute": 0.10210069801209667,
+    "relative_pct": 87.63955903637178
+  },
+  "multi_dimension": {
+    "by_season": {
+      "spring": null,
+      "summer": null,
+      "autumn": 0.0161,
+      "winter": null
+    },
+    "by_time": {
+      "workday": null,
+      "weekend": 0.0161
+    }
+  },
+  "optimization": {},
+  "score": 80
+}
