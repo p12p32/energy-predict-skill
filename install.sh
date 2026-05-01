@@ -20,7 +20,12 @@ detect_shell_rc() {
         zsh)  echo "$HOME/.zshrc" ;;
         bash) echo "$HOME/.bashrc" ;;
         fish) echo "$HOME/.config/fish/config.fish" ;;
-        *)    echo "$HOME/.bashrc" ;;
+        *)
+            for f in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+                if [ -f "$f" ]; then echo "$f"; return; fi
+            done
+            echo "$HOME/.bashrc"
+            ;;
     esac
 }
 RC_FILE=$(detect_shell_rc)

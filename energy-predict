@@ -5,8 +5,8 @@
 export ENERGY_HOME="${ENERGY_HOME:-$(cd "$(dirname "$0")" && pwd)}"
 cd "$ENERGY_HOME"
 
-# 自动探测 Python (适配不同机器)
-PYTHON=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || command -v python3.11 2>/dev/null || echo "python3")
+# 自动探测 Python (跨平台: Windows/macOS/Linux)
+PYTHON=$(command -v python 2>/dev/null || command -v python3 2>/dev/null || command -v python3.11 2>/dev/null || echo "python3")
 
 case "$1" in
   import)

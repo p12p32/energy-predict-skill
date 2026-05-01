@@ -348,13 +348,13 @@ def run_benchmark():
     print(f"\n  总分: {score}/100")
 
     if score >= 80:
-        print("  评级: 🌟 优秀 — 可以部署")
+        print("  评级: [优秀] — 可以部署")
     elif score >= 60:
-        print("  评级: ✅ 良好 — 实用级别")
+        print("  评级: [良好] — 实用级别")
     elif score >= 40:
-        print("  评级: ⚠️ 可用 — 需要继续优化")
+        print("  评级: [可用] — 需要继续优化")
     else:
-        print("  评级: ❌ 需改进 — 检查模型或数据")
+        print("  评级: [需改进] — 检查模型或数据")
 
     # ── 导出报告 ──
     report = {
