@@ -4,7 +4,7 @@ import yaml
 from typing import Any, Dict
 
 _CONFIG: Dict[str, Any] = {}
-_SKILL_HOME = os.environ.get("ENERGY_HOME", os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+_SKILL_HOME = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
 
 def load_config(config_path: str = None) -> Dict[str, Any]:

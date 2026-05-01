@@ -5,12 +5,12 @@ description: Use when model MAPE degrades or systematic bias is detected — hyp
 
 ## 工作空间
 
-`$ENERGY_HOME`
+所有命令在 skill 根目录下执行，路径自动推导。
 
 ## 触发优化
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+python3 -c "
 from scripts.orchestrator import Orchestrator
 import json
 o = Orchestrator()
@@ -22,7 +22,7 @@ print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 ## 查看知识库
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+python3 -c "
 from scripts.evolve.improver import Improver
 from scripts.core.data_source import FileSource
 imp = Improver(data_source=FileSource())
@@ -39,5 +39,5 @@ else:
 ## 精度基准测试
 
 ```bash
-cd $ENERGY_HOME && python3 tests/benchmark.py
+python3 tests/benchmark.py
 ```

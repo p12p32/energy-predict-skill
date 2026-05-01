@@ -5,12 +5,12 @@ description: Use when validating model accuracy, running backtests, or diagnosin
 
 ## 工作空间
 
-`$ENERGY_HOME`
+所有命令在 skill 根目录下执行，路径自动推导。
 
 ## 实时验证 (循环A)
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+python3 -c "
 from scripts.orchestrator import Orchestrator
 import json
 o = Orchestrator()
@@ -22,7 +22,7 @@ print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 ## 回塑验证 (循环B)
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+python3 -c "
 from scripts.orchestrator import Orchestrator
 o = Orchestrator()
 result = o.run_backtest_cycle('广东', 'load')

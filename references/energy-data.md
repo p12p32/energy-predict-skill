@@ -5,12 +5,12 @@ description: Use when importing CSV data, building features, fetching weather da
 
 ## 工作空间
 
-`$ENERGY_HOME` (由 install.sh 自动设置)
+所有命令在 skill 根目录下执行，路径自动推导。
 
 ## 导入 CSV
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+python3 -c "
 from scripts.core.data_source import FileSource
 FileSource().import_csv('data/my_data.csv')
 "
@@ -19,7 +19,7 @@ FileSource().import_csv('data/my_data.csv')
 ## 数据质量检测
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+python3 -c "
 from scripts.data.quality import DataQuality
 from scripts.data.features import FeatureStore
 store = FeatureStore()
@@ -34,7 +34,7 @@ if not df.empty:
 ## 构建特征
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+python3 -c "
 from scripts.data.features import FeatureStore, FeatureEngineer
 store = FeatureStore()
 engineer = FeatureEngineer()
@@ -49,7 +49,7 @@ if not raw.empty:
 ## 拉取气象数据
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+python3 -c "
 from scripts.data.fetcher import DataFetcher
 f = DataFetcher()
 df = f.fetch_weather('广东', '2025-01-01', '2025-01-31', mode='historical')

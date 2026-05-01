@@ -5,12 +5,12 @@ description: Use when executing electricity predictions — runs LightGBM quanti
 
 ## 工作空间
 
-`$ENERGY_HOME`
+所有命令在 skill 根目录下执行，路径自动推导。
 
 ## 预测
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+python3 -c "
 from scripts.orchestrator import Orchestrator
 o = Orchestrator()
 result = o.predict('广东', 'load', 24)
@@ -24,7 +24,7 @@ for r in result.get('sample', []):
 ## ASCII 图表
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+python3 -c "
 from scripts.orchestrator import Orchestrator
 print(Orchestrator().chart('广东', 'load', 24))
 "
@@ -33,7 +33,7 @@ print(Orchestrator().chart('广东', 'load', 24))
 ## 导出结果
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+python3 -c "
 from scripts.orchestrator import Orchestrator
 print(Orchestrator().export('广东', 'load', fmt='csv'))
 "

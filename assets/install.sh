@@ -84,7 +84,6 @@ echo "  已写入: $RC_FILE"
 echo ""
 echo "[3/3] 验证安装..."
 chmod +x "$SCRIPT_DIR/assets/energy-predict"
-export ENERGY_HOME="$SCRIPT_DIR"
 
 $PYTHON -c "from scripts.core.config import load_config; load_config(); print('  ✅ 配置加载')" 2>/dev/null || echo "  ⚠ 配置加载失败 (检查 config.yaml)"
 $PYTHON -c "import pandas, numpy; print(f'  ✅ pandas {pandas.__version__}, numpy {numpy.__version__}')" 2>/dev/null || echo "  ⚠ pandas/numpy 未安装"

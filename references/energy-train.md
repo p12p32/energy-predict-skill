@@ -5,12 +5,12 @@ description: Use when training or retraining LightGBM models, checking model sta
 
 ## 工作空间
 
-`$ENERGY_HOME`
+所有命令在 skill 根目录下执行，路径自动推导。
 
 ## 全量训练
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+python3 -c "
 from scripts.orchestrator import Orchestrator
 o = Orchestrator()
 o.train_all()
@@ -20,7 +20,7 @@ o.train_all()
 ## 查看模型
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+python3 -c "
 import os, json
 path = 'models/model_registry.json'
 if os.path.exists(path):
@@ -34,7 +34,7 @@ if os.path.exists(path):
 ## 特征重要性
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+python3 -c "
 from scripts.orchestrator import Orchestrator
 o = Orchestrator()
 result = o.explain('广东', 'load')
@@ -46,7 +46,7 @@ for f in result['feature_importance'][:10]:
 ## 版本回滚
 
 ```bash
-cd $ENERGY_HOME && python3 -c "
+python3 -c "
 from scripts.orchestrator import Orchestrator
 o = Orchestrator()
 print(o.rollback_model('广东', 'load'))
