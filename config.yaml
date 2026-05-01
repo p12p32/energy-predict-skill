@@ -1,5 +1,6 @@
 # config.yaml — 全局配置
 data_source: "file"               # file(零依赖) | memory(临时) | doris(生产)
+watch_dir: ""                     # file 模式监控目录 (daemon 自动扫描新 CSV)
 
 doris:
   host: "127.0.0.1"

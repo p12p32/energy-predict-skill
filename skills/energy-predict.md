@@ -199,14 +199,33 @@ print(Orchestrator().chart('广东', 'load', 24))
 
 ---
 
+## /data-source <file|doris>
+
+配置 daemon 的持续数据来源:
+
+```bash
+cd $ENERGY_HOME && ${PYTHON:-python3} -c "
+from src.core.config import load_config
+print(f\"当前: {load_config().get('data_source', 'file')}\")
+"
+# 改 config.yaml: data_source: doris → daemon 自动轮询 Doris
+# 改 config.yaml: watch_dir: /path/to/data → 监控 CSV 目录
+```
+
+---
+
 ## /daemon <start|once>
 
 ```bash
 cd $ENERGY_HOME
-# 持续运行
-${PYTHON:-python3} src/daemon.py --interval 15 &
-# 单次测试
+# 持续运行 (拉新数据 → 预测 → 验证 → 改进)
+${PYTHON:-python3} src/daemon.py --interval 15
+# 单次
 ${PYTHON:-python3} src/daemon.py --once
+# Doris
+${PYTHON:-python3} src/daemon.py --source doris --interval 15
+# CSV 目录
+${PYTHON:-python3} src/daemon.py --watch /data/electricity --interval 15
 ```
 
 ---
