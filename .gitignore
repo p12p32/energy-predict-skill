@@ -5,3 +5,4 @@ models/
 *.lgb
 *.pkl
 .energy_data/
+benchmark_report.json
