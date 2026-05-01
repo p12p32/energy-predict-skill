@@ -199,7 +199,7 @@ class Trainer:
             raise FileNotFoundError(f"未找到模型版本: {key}")
 
         idx = version if version == -1 else min(version, len(versions) - 1)
-        model_filename = versions[-(idx if idx == -1 else idx + 1)]
+        model_filename = versions[idx]
         model_path = os.path.join(self.model_dir, province, model_filename)
 
         if not os.path.exists(model_path):
