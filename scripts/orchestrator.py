@@ -67,15 +67,8 @@ class Orchestrator:
                     continue
 
                 features = self.engineer.build_features_from_raw(raw)
-
-                try:
-                    weather = self.fetcher.fetch_weather(
-                        p, start_date, end_date, mode="historical"
-                    )
-                    if not weather.empty:
-                        features = self.engineer.merge_weather(features, weather)
-                except Exception as e:
-                    logger.warning(f"  气象数据合并失败: {e}")
+                # build_features_from_raw 自动处理 CSV 中已有的所有列:
+                # 气象 → CDD/HDD/THI 等, 日历 → is_holiday/bridge_day 等, 周期 → sin/cos 编码
 
                 count = self.store.insert_features(features)
                 logger.info(f"  {p}/{t}: 写入 {count} 行")

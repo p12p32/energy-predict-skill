@@ -139,14 +139,24 @@ class FeatureEngineer:
 
     def merge_weather(self, features: pd.DataFrame,
                       weather: pd.DataFrame) -> pd.DataFrame:
-        weather_subset = weather[
-            ["dt", "province", "temperature", "humidity",
-             "wind_speed", "wind_direction", "solar_radiation",
-             "precipitation", "pressure"]
-        ].copy()
-        return features.merge(
-            weather_subset, on=["dt", "province"], how="left"
+        _weather_cols = ["temperature", "humidity", "wind_speed",
+                         "wind_direction", "solar_radiation",
+                         "precipitation", "pressure"]
+        available = [c for c in _weather_cols if c in weather.columns]
+        if not available:
+            return features
+        weather_subset = weather[["dt", "province"] + available].copy()
+        # 截断到小时以匹配电力数据的15分钟粒度
+        features["_dt_hour"] = features["dt"].dt.floor("h")
+        weather_subset = weather_subset.rename(columns={"dt": "_dt_hour"})
+        result = features.merge(
+            weather_subset, on=["_dt_hour", "province"], how="left"
         )
+        result.drop(columns=["_dt_hour"], inplace=True)
+        # 合并后重新计算派生天气特征 (CDD/HDD/THI 等)
+        wfe = WeatherFeatureEngineer()
+        result = wfe.transform(result)
+        return result
 
 
 class FeatureStore:
@@ -168,6 +178,9 @@ class FeatureStore:
             "is_weekend", "season",
             "temperature", "humidity", "wind_speed", "wind_direction",
             "solar_radiation", "precipitation", "pressure",
+            "CDD", "HDD", "THI", "wind_power_potential",
+            "solar_potential", "solar_efficiency",
+            "temp_change_1h", "temp_change_6h", "consecutive_hot_days",
             "value_lag_1d", "value_lag_7d",
             "value_rolling_mean_24h",
             "value_diff_1d", "value_diff_7d",

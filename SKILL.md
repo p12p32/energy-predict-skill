@@ -65,6 +65,66 @@ fi
 - 省份不在 config 列表内（当前: 广东/云南/四川/江苏/山东/浙江/河南）
 - 纯粹的数据分析/可视化（用 pandas/matplotlib 更直接）
 
+## 预测维度
+
+电力预测精度取决于特征覆盖度。以下维度重要性递减，**AI 应主动搜索和获取外部数据来丰富特征**：
+
+### 1. 气象（出力 + 负荷核心驱动）
+
+| 变量 | 列名 | 对负荷影响 | 对出力影响 |
+|------|------|-----------|-----------|
+| 温度 | `temperature` | 空调负荷 ↑↑ (夏>26°C, 冬<18°C) | 光伏效率 ↓ (高温) |
+| 湿度 | `humidity` | 体感温度 → 空调负荷 | 火电效率 ↓ |
+| 风速 | `wind_speed` | 体感温度 | 风电 P ∝ v³ |
+| 太阳辐射 | `solar_radiation` | 照明负荷 ↓ | 光伏主力 |
+| 降水量 | `precipitation` | 户外活动 ↓ → 负荷 ↓ | 水电来水 ↑ |
+| 气压 | `pressure` | 天气系统指示 | 影响微弱 |
+
+> 系统从以上 6 个基础变量自动派生：`CDD`(制冷度日)、`HDD`(采暖度日)、`THI`(温湿指数)、`wind_power_potential`(风功率 ∝ v³)、`solar_efficiency`(高温衰减)、`temp_change_1h/6h`(温度变化率)、`consecutive_hot_days`(连续高温)。
+
+**数据获取：** 使用 WebSearch 搜索 "{省份} 历史天气数据" 或直接调用 Open-Meteo API (`https://archive-api.open-meteo.com/v1/archive`)，写入 CSV 的对应列。
+
+### 2. 日历（负荷模式核心）
+
+系统自动从 `dt` 列计算：`hour`、`day_of_week`、`is_weekend`、`season`，以及 sin/cos 周期编码。
+
+节假日需外部获取——**春节是中国电力负荷最大扰动**（降幅 30-50%）：
+
+| 影响等级 | 节假日 | 负荷特征 |
+|---------|--------|---------|
+| 极大 | 春节 | 工业负荷骤降，居民负荷上升 |
+| 大 | 国庆 | 类似但幅度小 |
+| 中 | 清明、五一、端午、中秋 | 短期波动 |
+
+> 系统从 `dt` 自动计算：`is_holiday`、`is_work_weekend`(调休)、`days_to_holiday`(节前效应)、`days_from_holiday`(节后恢复)、`bridge_day`(桥接日)、`school_holiday`(寒暑假)、`working_day_type`(7 类精细编码)。节假日库已覆盖 2023-2032。
+
+### 3. 经济（电价核心驱动）
+
+| 变量 | 列名 | 影响 |
+|------|------|------|
+| 煤价 | `coal_price` | 火电边际成本 → 电价 (中国 60%+ 火电) |
+| 碳价 | `carbon_price` | 碳排放成本 → 电价 |
+| 工业产值 | `industrial_output` | 工业用电 → 负荷 |
+
+> **数据获取：** 煤价可从秦皇岛煤炭网、中国煤炭市场网获取；碳价从全国碳排放权交易市场。
+
+### 4. 电网调度（出力相关）
+
+- 检修计划 → 出力骤降
+- 省间联络线 → 出力/负荷变化
+- 新能源弃电率 → 实际出力 < 理论出力
+
+### AI 数据获取策略
+
+**不要等用户提供数据。** 阅读上述维度后，主动：
+
+1. **搜索**：用 WebSearch 找公开数据（气象局、能源局、交易中心）
+2. **调用 API**：Open-Meteo (免费气象)、EIA (美国能源)、公开数据集
+3. **写入 CSV**：将获取的数据按 `dt, province, type, value, [额外列...]` 格式写入
+4. **导入**：`/import` 后系统自动处理所有列
+
+> 系统不做任何预设的外部 API 调用。你拿到什么数据，就导入什么。模型自动利用所有列。
+
 ## Environment
 
 所有命令在 `$ENERGY_HOME` 下执行。Python 解释器自动探测（`python3`/`python`/`python3.11`）。
@@ -79,6 +139,7 @@ fi
 | LightGBM 缺编译 | 缺少 C 编译器 | `brew install libomp && pip install lightgbm` |
 | 省份名不识别 | 不在 config 列表 | 用 7 省名之一，或编辑 `assets/config.yaml` |
 | MAPE 突然升高 | 节假日/极端天气 | 触发 `/improve` 让模型自适应 |
+| 特征只有时序 | 未搜集外部数据 | 读"预测维度"章节，搜索气象/日历/经济数据 |
 
 ---
 
@@ -97,9 +158,15 @@ for r in result.get('sample', []):
 
 ## /import <csv路径>
 
+**导入前，先根据"预测维度"主动搜集外部数据丰富 CSV：**
+
 ```bash
+# 1. AI 搜集数据 → 构造含多维特征的 CSV → 写入文件
+# 2. 导入
 cd $ENERGY_HOME && python3 -c "from scripts.core.data_source import FileSource; FileSource().import_csv('data/my_data.csv')"
 ```
+
+CSV 必需列：`dt, province, type, value`；可选列：`temperature, humidity, wind_speed, solar_radiation, precipitation, pressure, coal_price, carbon_price, price` 及任意自定义列。
 
 ## /backtest <省份> <类型>
 
@@ -203,11 +270,14 @@ cd $ENERGY_HOME && python3 tests/benchmark.py
 ## Data Flow
 
 ```
-CSV → FileSource.import_csv() → FeatureEngineer → FeatureStore
-     → Trainer.train() → models/*.lgb
-     → Predictor.predict() → P10/P50/P90 + ECM 残差修正
-     → Validator → 退化检测 → Improver → 重训 → 新模型部署
+AI 搜索/采集外部数据 → 构造 CSV → /import
+  → FileSource.import_csv() → FeatureEngineer → FeatureStore
+  → Trainer.train() → models/*.lgb
+  → Predictor.predict() → P10/P50/P90 + ECM 残差修正
+  → Validator → 退化检测 → Improver → 重训 → 新模型部署
 ```
+
+**AI 的职责是丰富特征维度；scripts/ 只负责处理，不负责获取外部数据。**
 
 ## Sub-Skills
 

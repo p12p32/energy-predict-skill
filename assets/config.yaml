@@ -44,15 +44,6 @@ types:
   - load
   - price
 
-external_data:
-  weather:
-    source: "open-meteo"
-    qweather_api_key: ""
-  coal_price:
-    enabled: false
-  carbon_price:
-    enabled: false
-
 province_coords:
   广东: { lat: 23.13, lon: 113.26 }
   云南: { lat: 25.04, lon: 102.72 }
