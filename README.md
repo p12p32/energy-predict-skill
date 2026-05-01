@@ -5,7 +5,7 @@
 ## 安装
 
 ```bash
-git clone <repo-url> && cd energy-predict-skill
+git clone https://github.com/p12p32/energy-predict-skill.git && cd energy-predict-skill
 bash assets/install.sh
 source ~/.zshrc
 ```
@@ -46,6 +46,11 @@ dt,province,type,value,price
 | `energy-predict benchmark` | 精度测试 |
 | `energy-predict daemon [分钟]` | 自动运行 |
 
-## 作为 OpenCode Skill
+## 作为 Claude Code / OpenCode Skill
 
-将 `SKILL.md` 复制到你的 OpenCode skills 目录即可自动激活。
+**不能只复制 SKILL.md。** 需要整个仓库目录：
+```bash
+git clone https://github.com/p12p32/energy-predict-skill.git
+# 将整个 energy-predict-skill/ 目录作为 skill 安装
+```
+SKILL.md 依赖同目录下的 `scripts/` 和 `assets/`，三者必须在同一父目录下才能正常工作。

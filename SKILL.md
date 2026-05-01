@@ -7,6 +7,22 @@ description: Use when users ask for electricity load forecasting, power output p
 
 LightGBM 分位数回归 + 自进化闭环。覆盖 7 省 × 3 类型（出力/负荷/电价）。
 
+## 安装（必读）
+
+> **仅复制 SKILL.md 无法使用。** 本 Skill 依赖 `scripts/` 和 `assets/` 目录中的 Python 代码和配置文件，两者必须与 SKILL.md 在同一目录下。
+
+```bash
+git clone https://github.com/p12p32/energy-predict-skill.git
+cd energy-predict-skill
+bash assets/install.sh
+source ~/.zshrc  # 或 ~/.bashrc
+```
+
+安装后验证：
+```bash
+ls scripts/core/config.py && echo "✅ 安装正确" || echo "❌ 缺少 scripts/，请 git clone 整个仓库"
+```
+
 ## Quick Reference
 
 | 命令 | 用途 |
