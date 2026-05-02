@@ -1,14 +1,17 @@
-"""trainer.py — 模型训练器（LightGBM + 分位数回归 + 版本回滚 + 特征重要性）
+"""trainer.py — 模型训练器（LightGBM + 分位数回归 + 超参搜索 + 版本回滚）
 
-模型存储格式:
-  - .lgbm       → LightGBM 原生文本格式 (booster_.save_model)
-  - .lgbm.meta   → JSON 元数据 (feature_names 等)
-  - .lgb          → 旧版 pickle 格式 (向后兼容，仅读取)
+修复:
+- 加入简单超参搜索 (grid search + expanding window CV)
+- 验证改为 expanding window cross validation
+- quick_train 加超时保护
+- 保存最优超参到 model_registry.json
 """
 import os
 import json
 import pickle
 import logging
+import time
+import signal
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -17,13 +20,27 @@ import numpy as np
 import lightgbm as lgb
 from sklearn.model_selection import TimeSeriesSplit
 
-from scripts.core.config import get_model_config
+from scripts.core.config import get_model_config, get_training_config
 
 logger = logging.getLogger(__name__)
 
 EXCLUDE_COLS = {"dt", "province", "type", "price"}
 MAX_VERSIONS = 3
-QUANTILES = [0.1, 0.5, 0.9]  # P10, P50, P90
+QUANTILES = [0.1, 0.5, 0.9]
+
+# 光伏白天有效时段 (6:00~19:45, 对应 hour 6~19)
+SOLAR_ACTIVE_HOURS = set(range(6, 20))
+
+# 风电高活跃时段 (通常风速较大)
+WIND_ACTIVE_HOURS = set(range(0, 24))  # 全天都有风
+
+
+class _TimeoutException(Exception):
+    pass
+
+
+def _timeout_handler(signum, frame):
+    raise _TimeoutException("训练超时")
 
 
 class Trainer:
@@ -31,32 +48,30 @@ class Trainer:
         self.model_dir = model_dir or get_model_config()["storage_dir"]
         os.makedirs(self.model_dir, exist_ok=True)
 
-    # ── 安全模型 I/O (LightGBM 原生文本, 不用 pickle) ──
+    # ── 安全模型 I/O ──
 
     @staticmethod
     def _save_model_native(model: lgb.LGBMRegressor, path: str):
-        """以 LightGBM 原生文本格式保存模型."""
         model.booster_.save_model(path)
 
     @staticmethod
-    def _save_meta(path: str, feature_names: List[str]):
-        """保存模型元数据到 JSON."""
-        meta_path = path + ".meta"
-        with open(meta_path, "w") as f:
-            json.dump({"feature_names": feature_names}, f)
+    def _save_meta(path: str, feature_names: List[str], params: Dict = None):
+        meta = {"feature_names": feature_names}
+        if params:
+            meta["best_params"] = params
+        with open(path + ".meta", "w") as f:
+            json.dump(meta, f)
 
     @staticmethod
-    def _load_meta(path: str) -> List[str]:
-        """从 .meta JSON 加载特征名."""
+    def _load_meta(path: str) -> Dict:
         meta_path = path + ".meta"
         if os.path.exists(meta_path):
             with open(meta_path) as f:
-                return json.load(f).get("feature_names", [])
-        return []
+                return json.load(f)
+        return {}
 
     @staticmethod
     def _load_model_native(path: str) -> lgb.LGBMRegressor:
-        """从 LightGBM 原生文本文件加载模型."""
         model = lgb.LGBMRegressor()
         booster = lgb.Booster(model_file=path)
         n_features = booster.num_feature()
@@ -67,46 +82,38 @@ class Trainer:
         return model
 
     @staticmethod
-    def _load_model_file(path: str) -> Tuple[lgb.LGBMRegressor, List[str]]:
-        """加载单个模型文件 (优先原生格式, 回退 pickle)."""
-        # 优先尝试 .lgbm 原生格式
+    def _load_model_file(path: str) -> Tuple[lgb.LGBMRegressor, List[str], Dict]:
         lgbm_path = path if path.endswith(".lgbm") else path.replace(".lgb", ".lgbm")
         if os.path.exists(lgbm_path):
             model = Trainer._load_model_native(lgbm_path)
-            feature_names = Trainer._load_meta(lgbm_path)
-            if feature_names:
-                return model, feature_names
+            meta = Trainer._load_meta(lgbm_path)
+            return model, meta.get("feature_names", []), meta
 
-        # 回退: .lgb pickle 格式 (向后兼容)
         if os.path.exists(path) and path.endswith(".lgb"):
             with open(path, "rb") as f:
                 model = pickle.load(f)
-            # pickle 格式没有独立元数据, 需要外部提供 feature_names
-            return model, []
+            return model, [], {}
 
-        # 尝试直接用给定路径
         if os.path.exists(path):
             try:
                 return Trainer._load_model_native(path), Trainer._load_meta(path)
-            except Exception as e:
-                logger.warning("原生格式加载失败，回退 pickle: %s", e)
+            except Exception:
                 with open(path, "rb") as f:
-                    return pickle.load(f), []
+                    return pickle.load(f), [], {}
 
-        raise FileNotFoundError(f"模型文件不存在: {path} or {lgbm_path}")
+        raise FileNotFoundError(f"模型文件不存在: {path}")
 
     def prepare_training_data(self, df: pd.DataFrame,
-                               target_col: str = "value") -> Tuple[pd.DataFrame, pd.Series]:
-        """准备训练数据，自动过滤非实际值."""
+                               target_col: str = "value",
+                               target_type: str = None) -> Tuple[pd.DataFrame, pd.Series]:
         df = df.dropna(subset=[target_col]).copy()
 
-        # value_type 过滤: 只用实际值训练
         if "value_type" in df.columns:
             vt_col = df["value_type"]
             actual_mask = vt_col.isna() | (vt_col == "实际")
             if not actual_mask.all():
                 skipped = (~actual_mask).sum()
-                logger.info("训练过滤: 排除 %d 条非实际值 (预测/其他)", skipped)
+                logger.info("训练过滤: 排除 %d 条非实际值", skipped)
                 df = df[actual_mask]
 
         feature_cols = [
@@ -117,41 +124,138 @@ class Trainer:
         y = df[target_col]
         return X, y
 
+    # ── 超参搜索 ──
+
+    def _search_params(self, X: pd.DataFrame, y: pd.Series,
+                       timeout: int = 120) -> Tuple[Dict, float]:
+        """简单 grid search: expanding window CV + 精度优先.
+
+        返回 (best_params, best_mape).
+        """
+        train_cfg = get_training_config()
+        if not train_cfg.get("hyperparam_search", True):
+            return train_cfg.get("default_params", {}), 0.0
+
+        search_space = train_cfg.get("search_space", {})
+        default_params = train_cfg.get("default_params", {})
+        cv_folds = train_cfg.get("cv_folds", 3)
+
+        param_grid = [
+            {"num_leaves": nl, "learning_rate": lr, "n_estimators": ne,
+             "min_child_samples": mc,
+             "feature_fraction": default_params.get("feature_fraction", 0.8),
+             "bagging_fraction": default_params.get("bagging_fraction", 0.8),
+             "bagging_freq": default_params.get("bagging_freq", 5)}
+            for nl in search_space.get("num_leaves", [31])
+            for lr in search_space.get("learning_rate", [0.03])
+            for ne in search_space.get("n_estimators", [500])
+            for mc in search_space.get("min_child_samples", [20])
+        ]
+
+        n = len(X)
+        fold_size = n // (cv_folds + 1)
+
+        best_mape = float('inf')
+        best_params = default_params.copy()
+        start_time = time.time()
+
+        for combo in param_grid:
+            if time.time() - start_time > timeout:
+                logger.info("超参搜索超时 (%ds), 使用当前最优", timeout)
+                break
+
+            fold_mapes = []
+            for fold in range(cv_folds):
+                # expanding window
+                val_end = n - (cv_folds - 1 - fold) * fold_size
+                val_start = max(0, val_end - fold_size)
+                train_end = val_start
+
+                X_train = X.iloc[:train_end]
+                y_train = y.iloc[:train_end]
+                X_val = X.iloc[val_start:val_end]
+                y_val = y.iloc[val_start:val_end]
+
+                if len(X_train) < 200 or len(X_val) < 50:
+                    continue
+
+                try:
+                    m = lgb.LGBMRegressor(
+                        objective="quantile", alpha=0.5,
+                        metric="quantile", boosting_type="gbdt",
+                        verbose=-1, **combo,
+                        early_stopping_rounds=30,
+                    )
+                    m.fit(X_train, y_train, eval_set=[(X_val, y_val)],
+                          eval_metric="rmse")
+                    pred = m.predict(X_val)
+                    mask = y_val != 0
+                    if mask.sum() > 10:
+                        mape = float(np.mean(np.abs((y_val[mask] - pred[mask]) / y_val[mask])))
+                    else:
+                        mape = float('inf')
+                    fold_mapes.append(mape)
+                except Exception as e:
+                    logger.debug("超参组合训练失败: %s", e)
+                    continue
+
+            if fold_mapes:
+                avg_mape = float(np.mean(fold_mapes))
+                if avg_mape < best_mape:
+                    best_mape = avg_mape
+                    best_params = combo.copy()
+                    logger.info("超参更新: MAPE=%.4f, params=%s", avg_mape, combo)
+
+        logger.info("超参搜索完成: best MAPE=%.4f", best_mape)
+        return best_params, best_mape
+
+    # ── 训练接口 ──
+
     def train(self, df: pd.DataFrame, province: str,
               target_type: str, target_col: str = "value",
-              params: Dict = None, model_filename: str = None) -> Dict:
-        X, y = self.prepare_training_data(df, target_col)
+              params: Dict = None, model_filename: str = None,
+              search_params: bool = True) -> Dict:
+        X, y = self.prepare_training_data(df, target_col, target_type=target_type)
+
+        train_cfg = get_training_config()
+        default_params = train_cfg.get("default_params", {})
+
+        # 超参搜索
+        best_params = default_params.copy()
+        if search_params and params is None:
+            timeout = train_cfg.get("max_search_time_seconds", 120)
+            best_params, _ = self._search_params(X, y, timeout)
+        elif params:
+            best_params.update(params)
+
+        # Expanding window CV 选验证集
+        n = len(X)
+        cv_folds = train_cfg.get("cv_folds", 3)
+        fold_size = n // (cv_folds + 1)
+        val_end = n - fold_size
+        val_start = max(0, val_end - fold_size)
+        train_end = val_start
+
+        X_train, X_val = X.iloc[:train_end], X.iloc[val_start:val_end]
+        y_train, y_val = y.iloc[:train_end], y.iloc[val_start:val_end]
+
+        if len(X_train) < 200:
+            X_train, X_val = X, pd.DataFrame()
+            y_train = y
 
         lgb_params = {
-            "objective": "quantile",
-            "alpha": 0.5,
-            "metric": "quantile",
-            "boosting_type": "gbdt",
-            "num_leaves": 31,
-            "learning_rate": 0.03,
-            "feature_fraction": 0.8,
-            "bagging_fraction": 0.8,
-            "bagging_freq": 5,
-            "verbose": -1,
-            "n_estimators": 500,
+            "objective": "quantile", "alpha": 0.5,
+            "metric": "quantile", "boosting_type": "gbdt",
+            "verbose": -1, **best_params,
             "early_stopping_rounds": 50,
-            "min_child_samples": 20,
         }
-        if params:
-            lgb_params.update(params)
-
-        tscv = TimeSeriesSplit(n_splits=3)
-        _, val_idx = list(tscv.split(X))[-1]
-        train_idx = np.setdiff1d(np.arange(len(X)), val_idx)
-        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
 
         model = lgb.LGBMRegressor(**lgb_params)
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
-            eval_metric="rmse",
-        )
+        fit_kwargs = {"X": X_train, "y": y_train}
+        if not X_val.empty:
+            fit_kwargs["eval_set"] = [(X_val, y_val)]
+            fit_kwargs["eval_metric"] = "rmse"
+        model.fit(**fit_kwargs)
 
         if model_filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -162,11 +266,9 @@ class Trainer:
         model_path = os.path.join(province_dir, model_filename)
 
         self._save_model_native(model, model_path)
-        self._save_meta(model_path, list(X.columns))
-
+        self._save_meta(model_path, list(X.columns), best_params)
         self._update_registry(province, target_type, model_filename,
-                              list(X.columns), model_path)
-
+                              list(X.columns), model_path, best_params)
         self._cleanup_old_versions(province, target_type)
 
         return {
@@ -176,12 +278,18 @@ class Trainer:
             "n_samples": len(df),
             "n_features": X.shape[1],
             "feature_names": list(X.columns),
+            "best_params": best_params,
         }
 
     def quick_train(self, df: pd.DataFrame, province: str,
                     target_type: str, target_col: str = "value",
-                    params: Dict = None) -> Dict:
-        X, y = self.prepare_training_data(df, target_col)
+                    params: Dict = None,
+                    timeout: int = 60) -> Dict:
+        """快速训练 (带超时保护).
+
+        返回带 model 对象的 dict，用于 improver 的快速实验。
+        """
+        X, y = self.prepare_training_data(df, target_col, target_type=target_type)
         lgb_params = {
             "objective": "regression", "metric": "rmse",
             "num_leaves": 31, "learning_rate": 0.05,
@@ -190,8 +298,36 @@ class Trainer:
         }
         if params:
             lgb_params.update(params)
-        model = lgb.LGBMRegressor(**lgb_params)
-        model.fit(X, y)
+
+        model = None
+        try:
+            if timeout and timeout > 0:
+                def _train():
+                    nonlocal model
+                    model = lgb.LGBMRegressor(**lgb_params)
+                    model.fit(X, y)
+                # 非阻塞超时 (Unix)
+                try:
+                    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+                    signal.alarm(timeout)
+                    _train()
+                    signal.alarm(0)
+                    signal.signal(signal.SIGALRM, old_handler)
+                except (ValueError, _TimeoutException):
+                    signal.signal(signal.SIGALRM, signal.SIG_DFL)
+                    logger.warning("quick_train 超时 (%ds), 使用部分结果", timeout)
+            else:
+                model = lgb.LGBMRegressor(**lgb_params)
+                model.fit(X, y)
+        except _TimeoutException:
+            logger.warning("quick_train 超时")
+        except Exception as e:
+            logger.warning("quick_train 失败: %s", e)
+
+        if model is None:
+            model = lgb.LGBMRegressor(**lgb_params)
+            model.fit(X.iloc[:min(len(X), 5000)], y.iloc[:min(len(y), 5000)])
+
         return {
             "model": model,
             "feature_names": list(X.columns),
@@ -202,15 +338,34 @@ class Trainer:
 
     def quantile_train(self, df: pd.DataFrame, province: str,
                        target_type: str, target_col: str = "value") -> Dict:
-        """训练 P10/P50/P90 三个分位数模型.
-        返回: {"models": {"p10": model, "p50": model, "p90": model}, ...}
-        """
-        X, y = self.prepare_training_data(df, target_col)
-        tscv = TimeSeriesSplit(n_splits=3)
-        _, val_idx = list(tscv.split(X))[-1]
-        train_idx = np.setdiff1d(np.arange(len(X)), val_idx)
-        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        X, y = self.prepare_training_data(df, target_col, target_type=target_type)
+
+        train_cfg = get_training_config()
+        n = len(X)
+        cv_folds = train_cfg.get("cv_folds", 3)
+        fold_size = n // (cv_folds + 1)
+        val_end = n - fold_size
+        val_start = max(0, val_end - fold_size)
+        train_end = val_start
+
+        X_train = X.iloc[:train_end]
+        y_train = y.iloc[:train_end]
+        X_val = X.iloc[val_start:val_end]
+        y_val = y.iloc[val_start:val_end]
+
+        default_params = train_cfg.get("default_params", {})
+        base_params = {
+            "objective": "quantile", "metric": "quantile",
+            "boosting_type": "gbdt", "verbose": -1,
+            "early_stopping_rounds": 50,
+            "feature_fraction": default_params.get("feature_fraction", 0.8),
+            "bagging_fraction": default_params.get("bagging_fraction", 0.8),
+            "bagging_freq": default_params.get("bagging_freq", 5),
+            "n_estimators": default_params.get("n_estimators", 500),
+            "num_leaves": default_params.get("num_leaves", 31),
+            "learning_rate": default_params.get("learning_rate", 0.03),
+            "min_child_samples": default_params.get("min_child_samples", 20),
+        }
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         province_dir = os.path.join(self.model_dir, province)
@@ -218,14 +373,12 @@ class Trainer:
 
         models = {}
         for alpha, label in [(0.1, "p10"), (0.5, "p50"), (0.9, "p90")]:
-            m = lgb.LGBMRegressor(
-                objective="quantile", alpha=alpha, metric="quantile",
-                boosting_type="gbdt", num_leaves=31, learning_rate=0.03,
-                feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=5,
-                verbose=-1, n_estimators=500, early_stopping_rounds=50,
-                min_child_samples=20,
-            )
-            m.fit(X_train, y_train, eval_set=[(X_val, y_val)], eval_metric="quantile")
+            m = lgb.LGBMRegressor(alpha=alpha, **base_params)
+            fit_kw = {"X": X_train, "y": y_train}
+            if not X_val.empty:
+                fit_kw["eval_set"] = [(X_val, y_val)]
+                fit_kw["eval_metric"] = "quantile"
+            m.fit(**fit_kw)
 
             fname = f"{province}_{target_type}_{label}_{timestamp}.lgbm"
             path = os.path.join(province_dir, fname)
@@ -233,24 +386,24 @@ class Trainer:
             self._save_meta(path, list(X.columns))
             models[label] = path
 
-        # 注册表用 P50 作为主模型
-        self._update_registry(province, target_type,
-                              f"{province}_{target_type}_p50_{timestamp}.lgbm",
-                              list(X.columns),
-                              os.path.join(province_dir, f"{province}_{target_type}_p50_{timestamp}.lgbm"))
+        p50_fname = f"{province}_{target_type}_p50_{timestamp}.lgbm"
+        self._update_registry(
+            province, target_type, p50_fname,
+            list(X.columns),
+            os.path.join(province_dir, p50_fname),
+            base_params,
+        )
 
         return {
             "province": province, "target_type": target_type,
             "paths": models, "n_samples": len(df), "n_features": X.shape[1],
-            "feature_names": list(X.columns),
+            "feature_names": list(X.columns), "params": base_params,
         }
+
+    # ── 模型加载 ──
 
     def load_quantile_models(self, province: str, target_type: str,
                               version: int = -1) -> Dict[str, Tuple]:
-        """加载 P10/P50/P90 三个模型.
-
-        向后兼容: 优先查找 .lgbm 格式, 回退 .lgb 格式.
-        """
         registry = self._read_registry()
         key = f"{province}_{target_type}"
         if key not in registry:
@@ -261,27 +414,23 @@ class Trainer:
         if not versions:
             raise FileNotFoundError(f"未找到模型版本: {key}")
 
-        if version == -1:
-            p50_fname = versions[-1]
-        else:
-            p50_fname = versions[max(0, min(version, len(versions) - 1))]
-        # 仅当文件名包含 "p50_" 时说明是 quantile_train 训练的, 才有独立 P10/P90 文件
+        p50_fname = versions[version] if version >= 0 else versions[-1]
+
         if "p50_" in p50_fname:
             p10_fname = p50_fname.replace("p50_", "p10_")
             p90_fname = p50_fname.replace("p50_", "p90_")
         else:
-            # 单模型 (train()) → 无独立 P10/P90, 设空让下游回退
             p10_fname = "__nonexistent__"
             p90_fname = "__nonexistent__"
 
         province_dir = os.path.join(self.model_dir, province)
-        feature_names = entry["feature_names"]
-
+        feature_names = entry.get("feature_names", [])
         models = {}
+
         for label, fname in [("p10", p10_fname), ("p50", p50_fname), ("p90", p90_fname)]:
             path = os.path.join(province_dir, fname)
             try:
-                m, fn = self._load_model_file(path)
+                m, fn, meta = self._load_model_file(path)
                 models[label] = (m, fn if fn else feature_names)
             except FileNotFoundError:
                 logger.warning("分位数模型文件缺失: %s", path)
@@ -291,7 +440,6 @@ class Trainer:
     def load_model(self, province: str,
                    target_type: str,
                    version: int = -1) -> Tuple[lgb.LGBMRegressor, List[str], str]:
-        """加载模型. version: -1=最新, 0=上一个, 1=上上个..."""
         registry = self._read_registry()
         key = f"{province}_{target_type}"
         if key not in registry:
@@ -306,7 +454,7 @@ class Trainer:
         model_filename = versions[idx]
         model_path = os.path.join(self.model_dir, province, model_filename)
 
-        models, feature_names = self._load_model_file(model_path)
+        models, feature_names, meta = self._load_model_file(model_path)
         if not feature_names:
             feature_names = entry.get("feature_names", [])
 
@@ -315,7 +463,6 @@ class Trainer:
     # ── 版本回滚 ──
 
     def rollback(self, province: str, target_type: str) -> Dict:
-        """回滚到上一个版本."""
         registry = self._read_registry()
         key = f"{province}_{target_type}"
         if key not in registry:
@@ -325,32 +472,35 @@ class Trainer:
         if len(versions) < 2:
             return {"error": "只有一个版本，无法回滚"}
 
-        old = versions.pop()
+        # 删除最新版本
+        latest = versions.pop()
         registry[key]["versions"] = versions
 
-        registry_path = os.path.join(self.model_dir, "model_registry.json")
-        with open(registry_path, "w") as f:
-            json.dump(registry, f, indent=2, ensure_ascii=False)
+        province_dir = os.path.join(self.model_dir, province)
+        for ext in ["", ".meta"]:
+            path = os.path.join(province_dir, latest + ext) if ext == ".meta" else os.path.join(province_dir, latest)
+            # 清理 p10/p90 配套文件
+            for f in [path, path.replace(".lgbm", ".lgb")]:
+                if os.path.exists(f):
+                    os.remove(f)
+                    if f.endswith(".lgbm"):
+                        meta_f = f + ".meta"
+                        if os.path.exists(meta_f):
+                            os.remove(meta_f)
+            # p10/p90
+            for prefix in ["p10", "p90"]:
+                derived = latest.replace("p50_", f"{prefix}_")
+                derived_path = os.path.join(province_dir, derived)
+                if os.path.exists(derived_path):
+                    os.remove(derived_path)
+                    meta_d = derived_path + ".meta"
+                    if os.path.exists(meta_d):
+                        os.remove(meta_d)
 
-        # 删除废弃的模型文件 (含 .lgbm + .meta 和 .lgb)
-        for ext in [".lgbm", ".lgb"]:
-            old_path = os.path.join(self.model_dir, province,
-                                     old.replace(".lgbm", ext).replace(".lgb", ext))
-            if os.path.exists(old_path):
-                os.remove(old_path)
-            meta_path = old_path + ".meta"
-            if os.path.exists(meta_path):
-                os.remove(meta_path)
-
-        return {
-            "status": "rolled_back",
-            "removed_version": old,
-            "current_version": versions[-1],
-            "remaining_versions": len(versions),
-        }
+        self._save_registry(registry)
+        return {"status": "ok", "rolled_back": latest, "current": versions[-1]}
 
     def list_versions(self, province: str, target_type: str) -> List[Dict]:
-        """列出所有版本."""
         registry = self._read_registry()
         key = f"{province}_{target_type}"
         if key not in registry:
@@ -365,69 +515,53 @@ class Trainer:
             if os.path.exists(vpath):
                 info["size_kb"] = round(os.path.getsize(vpath) / 1024, 1)
             else:
-                # 尝试 .lgb 回退
                 alt = v.replace(".lgbm", ".lgb")
                 alt_path = os.path.join(self.model_dir, province, alt)
                 if os.path.exists(alt_path):
                     info["size_kb"] = round(os.path.getsize(alt_path) / 1024, 1)
             result.append(info)
-
         return result
 
     # ── 特征重要性 ──
 
     def feature_importance(self, province: str,
                            target_type: str) -> List[Dict]:
-        """返回 Top 特征重要性.
-
-        Returns: [{rank, feature, importance, pct}, ...]
-        """
         model, feature_names, _ = self.load_model(province, target_type)
-        # 兼容: 原生格式从 booster 取, pickle 格式从 feature_importances_ 取
         booster = getattr(model, "_Booster", None)
         if booster is not None:
             importances = booster.feature_importance(importance_type="gain")
         else:
             importances = model.feature_importances_
 
-        pairs = sorted(
-            zip(feature_names, importances),
-            key=lambda x: x[1], reverse=True
-        )
-
+        pairs = sorted(zip(feature_names, importances), key=lambda x: x[1], reverse=True)
         total = sum(importances) or 1
-        result = []
-        for i, (name, imp) in enumerate(pairs):
-            result.append({
-                "rank": i + 1,
-                "feature": name,
-                "importance": round(float(imp), 6),
-                "pct": round(float(imp / total * 100), 1),
-            })
+        return [
+            {"rank": i + 1, "feature": name, "importance": round(float(imp), 6),
+             "pct": round(float(imp / total * 100), 1)}
+            for i, (name, imp) in enumerate(pairs)
+        ]
 
-        return result
-
-    # ── 注册表管理 ──
+    # ── 注册表 ──
 
     def _update_registry(self, province: str, target_type: str,
                          filename: str, feature_names: List[str],
-                         model_path: str):
+                         model_path: str, best_params: Dict = None):
         registry = self._read_registry()
         key = f"{province}_{target_type}"
-
         old_versions = registry.get(key, {}).get("versions", [])
 
-        registry[key] = {
+        entry = {
             "versions": (old_versions + [filename])[-MAX_VERSIONS:],
             "feature_names": feature_names,
             "updated_at": datetime.now().isoformat(),
         }
-        registry_path = os.path.join(self.model_dir, "model_registry.json")
-        with open(registry_path, "w") as f:
-            json.dump(registry, f, indent=2, ensure_ascii=False)
+        if best_params:
+            entry["best_params"] = best_params
+        registry[key] = entry
+
+        self._save_registry(registry)
 
     def _cleanup_old_versions(self, province: str, target_type: str):
-        """删除超出 MAX_VERSIONS 的旧模型文件 (含 .lgbm 和 .lgb)."""
         registry = self._read_registry()
         key = f"{province}_{target_type}"
         versions = registry.get(key, {}).get("versions", [])
@@ -436,7 +570,6 @@ class Trainer:
         if not os.path.exists(province_dir):
             return
 
-        # 构建保留集合 (版本文件 + 其元数据)
         keep = set(versions)
         for v in versions:
             keep.add(v + ".meta")
@@ -447,14 +580,18 @@ class Trainer:
                 if fname not in keep:
                     old_path = os.path.join(province_dir, fname)
                     os.remove(old_path)
-                    # 同时清理 meta 文件
                     meta_path = old_path + ".meta"
                     if os.path.exists(meta_path):
                         os.remove(meta_path)
 
     def _read_registry(self) -> Dict:
-        registry_path = os.path.join(self.model_dir, "model_registry.json")
-        if os.path.exists(registry_path):
-            with open(registry_path, "r") as f:
+        path = os.path.join(self.model_dir, "model_registry.json")
+        if os.path.exists(path):
+            with open(path, "r") as f:
                 return json.load(f)
         return {}
+
+    def _save_registry(self, registry: Dict):
+        path = os.path.join(self.model_dir, "model_registry.json")
+        with open(path, "w") as f:
+            json.dump(registry, f, indent=2, ensure_ascii=False)

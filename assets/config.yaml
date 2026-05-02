@@ -67,7 +67,44 @@ value_types:
   predicted: 预测
   default: 实际
 
-# 每个子类型需要的特征列，AI 据此搜索外部数据
+# 超参搜索配置
+training:
+  hyperparam_search: true
+  max_search_time_seconds: 120
+  cv_folds: 3
+  cv_type: "expanding"       # expanding | sliding
+  default_params:
+    num_leaves: 31
+    learning_rate: 0.03
+    n_estimators: 500
+    min_child_samples: 20
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 5
+  search_space:
+    num_leaves: [15, 31, 63, 127]
+    learning_rate: [0.01, 0.03, 0.05]
+    n_estimators: [300, 500, 1000]
+    min_child_samples: [10, 20, 50]
+
+# 缓存配置
+cache:
+  weather_dir: ".energy_data/weather"
+  forecast_ttl_seconds: 3600   # 预报缓存1小时
+  historical_ttl_seconds: -1   # 历史数据永久缓存
+
+# 预测配置
+prediction:
+  max_horizon_hours: 168
+  timeout_seconds: 60
+  auto_cross_type: true
+
+# 调度配置
+daemon:
+  timeout_seconds: 1800        # 30分钟全局超时
+  parallel_provinces: true
+
+# 每个子类型需要的特征列
 type_features:
   出力_风电:
     critical: [wind_speed, wind_direction, pressure]
@@ -112,9 +149,8 @@ type_features:
     critical: [coal_price, carbon_price]
     optional: [renewable_penetration]
 
-# 跨类型交互规则 — 控制 add_cross_type_features_v2
+# 跨类型交互规则
 cross_type_rules:
-  # 出力子类型之间的物理约束: 总出力 = 各子类之和
   output_siblings:
     - 出力_风电
     - 出力_光伏
@@ -122,18 +158,15 @@ cross_type_rules:
     - 出力_火电
     - 出力_核电
     - 出力_总
-  # 负荷子类型之间
   load_siblings:
     - 负荷_工业
     - 负荷_居民
     - 负荷_商业
     - 负荷_农业
     - 负荷_总
-  # 电价子类型
   price_siblings:
     - 电价_日前
     - 电价_实时
-  # 派生交互
   derived:
     - name: residual_demand
       formula: "load_total - output_wind - output_solar"

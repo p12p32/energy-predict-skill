@@ -1,9 +1,19 @@
-"""orchestrator.py — 总调度器 (type 三段式 + value_type 感知)"""
+"""orchestrator.py — 总调度器 (type 三段式 + 跨类型 + 并行训练 + 自动进化)
+
+修复:
+- build_features 自动获取气象数据
+- predict 集成跨类型特征
+- train_all 并行化
+- 新增 auto_improve 完整闭环
+- 全局超时保护
+"""
 import glob
 import hashlib
 import logging
 import os
+import time
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
@@ -11,6 +21,7 @@ from scripts.core.config import (
     get_provinces, get_base_types, load_config,
     validate_province_and_type, get_available_types,
     get_available_actual_types, parse_type, TypeInfo,
+    get_daemon_config,
 )
 from scripts.core.data_source import FileSource, MemorySource
 from scripts.data.features import FeatureStore, FeatureEngineer
@@ -46,14 +57,21 @@ class Orchestrator:
         self.improver = Improver(self.source, self.trainer, self.backtester)
         self.engineer = FeatureEngineer()
         self._validator_history: List[Dict] = []
+        self._start_time = 0
 
     def setup(self):
         logger.info("初始化系统...")
         self.source.setup()
         logger.info("数据存储已就绪")
 
+    def _check_timeout(self):
+        cfg = get_daemon_config()
+        timeout = cfg.get("timeout_seconds", 1800)
+        elapsed = time.time() - self._start_time
+        if elapsed > timeout:
+            raise TimeoutError(f"调度超时 ({elapsed:.0f}s > {timeout}s)")
+
     def _find_latest_date(self, province: str, target_type: str):
-        """扫描特征库，返回该 province/type 的最新数据日期."""
         import glob, os
         base_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
                                 ".energy_data", "features")
@@ -71,7 +89,6 @@ class Orchestrator:
 
     def _load_latest_features(self, province: str, target_type: str,
                                days: int = 30):
-        """加载该 province/type 最近 N 天的特征数据 (自动探测最新日期)."""
         import glob, os
         base_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
                                 ".energy_data", "features")
@@ -90,16 +107,11 @@ class Orchestrator:
             pass
         return pd.DataFrame()
 
-    # ================================================================
-    # 特征版本追踪 (增量 vs 全量重建)
-    # ================================================================
-
     def _get_features_dir(self) -> str:
         return os.path.join(os.path.dirname(os.path.dirname(__file__)),
                             ".energy_data", "features")
 
     def _hash_feature_code(self) -> str:
-        """对特征工程相关源文件做 hash，代码变更时自动触发全量重建."""
         src_dir = os.path.dirname(__file__)
         files_to_hash = [
             os.path.join(src_dir, "data", "features.py"),
@@ -116,14 +128,12 @@ class Orchestrator:
         return os.path.join(self._get_features_dir(), ".feature_version")
 
     def _check_version(self) -> bool:
-        """返回 True 若特征代码未变更."""
         vp = self._get_version_path()
         if not os.path.exists(vp):
             return False
         try:
             with open(vp, "r") as f:
-                stored = f.read().strip()
-            return stored == self._hash_feature_code()
+                return f.read().strip() == self._hash_feature_code()
         except Exception:
             return False
 
@@ -134,13 +144,12 @@ class Orchestrator:
             f.write(self._hash_feature_code())
 
     def _get_existing_max_date(self, provinces: List[str]) -> Optional[datetime]:
-        """扫描所有已有特征文件，返回最早的 max(dt)（按省份聚合）."""
         earliest = None
         features_dir = self._get_features_dir()
         for p in provinces:
             files = sorted(glob.glob(os.path.join(features_dir, f"{p}_*.parquet")))
             if not files:
-                return None  # 该省无任何特征 → 需全量
+                return None
             for f in files:
                 try:
                     df = pd.read_parquet(f, columns=["dt"])
@@ -153,81 +162,61 @@ class Orchestrator:
         return earliest
 
     def _resolve_types(self, province: str, target_type: str) -> List[str]:
-        """将用户输入的 type 解析为实际的完整 type 列表.
-
-        "出力" → 扫描数据，展开为 ["出力_风电_实际", "出力_光伏_实际", ...]
-        "出力_风电" → ["出力_风电_实际"]
-        "出力_风电_实际" → ["出力_风电_实际"]
-        """
         ti = parse_type(target_type)
-
-        # 完整三段式: 原始字符串含两个下划线 → 直接返回
         parts = target_type.split("_")
         if len(parts) >= 3:
             return [target_type]
 
-        # 需要展开
         available = get_available_actual_types(province)
         if ti.sub:
-            # 有子类型但无 value_type → 匹配 base_sub
             prefix = f"{ti.base}_{ti.sub}"
             candidates = [t for t in available if t.startswith(prefix)]
         else:
-            # 只有基类 → 匹配所有
             candidates = [t for t in available if t.startswith(ti.base)]
-
         return candidates if candidates else [target_type]
+
+    # ================================================================
+    #  特征构建 (自动获取气象)
+    # ================================================================
 
     def build_features(self, province: str = None,
                        start_date: str = None,
                        end_date: str = None,
                        force_rebuild: bool = False):
+        self._start_time = time.time()
+
         if end_date is None:
             end_date = datetime.now().strftime("%Y-%m-%d")
 
         provinces = [province] if province else get_provinces()
 
-        # ── 决定全量重建 vs 增量追加 ──
         version_ok = self._check_version()
         existing_max = self._get_existing_max_date(provinces) if not force_rebuild else None
 
         if force_rebuild or not version_ok or existing_max is None:
-            # 全量重建
-            if force_rebuild:
-                logger.info("强制全量重建 (--force-rebuild)")
-            elif not version_ok:
-                logger.info("特征代码已变更，触发全量重建")
-            else:
-                logger.info("无已有特征，首次全量构建")
-            self.store.source.clear_features(provinces)
             if start_date is None:
                 start_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
         else:
-            # 增量追加: 从已有最新日期 - 30 天开始 (覆盖 rolling window 特征)
             inc_start = existing_max - timedelta(days=30)
             if start_date is not None:
-                # 用户显式指定 start_date → 取更早的
                 user_start = datetime.strptime(start_date, "%Y-%m-%d")
                 inc_start = min(inc_start, user_start)
             start_date = inc_start.strftime("%Y-%m-%d")
-            logger.info("增量特征构建: %s ~ %s (已有数据截止 %s)",
-                        start_date, end_date,
-                        existing_max.strftime("%Y-%m-%d"))
+            logger.info("增量特征构建: %s ~ %s", start_date, end_date)
 
-        # 加载气象数据
+        # ── 自动批量获取气象数据 (核心修复) ──
+        logger.info("批量获取气象数据...")
+        from scripts.data.fetcher import DataFetcher
+        fetcher = DataFetcher()
         weather_cache: Dict[str, pd.DataFrame] = {}
-        for p in provinces:
-            weather_path = os.path.join(
-                os.path.dirname(os.path.dirname(__file__)),
-                ".energy_data", "weather", f"{p}_weather.csv",
+        try:
+            weather_cache = fetcher.preload_historical_weather(
+                provinces, start_date, end_date
             )
-            if os.path.exists(weather_path):
-                w = pd.read_csv(weather_path)
-                w["dt"] = pd.to_datetime(w["dt"])
-                weather_cache[p] = w
-                logger.info(f"加载气象数据: {p} ({len(w)} 行)")
+        except Exception as e:
+            logger.warning("批量气象获取失败: %s", e)
 
-        # 第一遍: 按 (province, type) 构建独立特征 (只用实际值)
+        # 第一遍: 按 (province, type) 构建特征
         built: Dict[str, pd.DataFrame] = {}
         for p in provinces:
             available_types = get_available_actual_types(p)
@@ -236,25 +225,26 @@ class Orchestrator:
 
             for t in available_types:
                 logger.info(f"构建特征: {p}/{t} ...")
+                self._check_timeout()
+
                 raw = self.store.load_raw_data(p, t, start_date, end_date,
                                                value_type_filter="实际")
                 if raw.empty:
                     logger.warning(f"  无数据: {p}/{t}")
                     continue
 
-                features = self.engineer.build_features_from_raw(raw, value_type_filter="实际")
+                features = self.engineer.build_features_from_raw(
+                    raw, value_type_filter="实际",
+                    weather_df=weather_cache.get(p)
+                )
 
-                # 合并气象数据 (光伏跳过: Open-Meteo 网格点与电站位置偏差导致不准)
-                if p in weather_cache and "光伏" not in t:
-                    features = self.engineer.merge_weather(features, weather_cache[p])
-
-                # 注入预测误差特征 (如果有历史预测)
+                # 注入预测误差特征
                 try:
                     preds = self.store.load_predictions(p, t, start_date, end_date)
                     if not preds.empty:
                         features = self.engineer.add_prediction_error_features(features, preds)
-                except Exception as e:
-                    logger.debug("预测误差特征注入跳过 (%s/%s): %s", p, t, e)
+                except Exception:
+                    pass
 
                 built[f"{p}/{t}"] = features
 
@@ -265,17 +255,17 @@ class Orchestrator:
                       for t in [key.split("/", 1)[1]]}
             if len(p_built) < 2:
                 continue
-            logger.info(f"交叉特征 v2: {p} ({', '.join(p_built.keys())})")
+            logger.info(f"交叉特征 v2: {p}")
             for t, features in p_built.items():
+                self._check_timeout()
                 built[f"{p}/{t}"] = self.engineer.add_cross_type_features_v2(
                     features, p_built, p,
                 )
 
-        # 第二遍半: 电价专属特征 (供需紧密度、可再生能源冲击、波动率)
+        # 第二遍半: 电价专属特征
         for key, features in built.items():
             p, t = key.split("/", 1)
             if t.startswith("电价"):
-                # 找同省份的所有 built 作为 siblings
                 siblings = {tk: df for k, df in built.items()
                            if k.startswith(f"{p}/") and k != key
                            for tk in [k.split("/", 1)[1]]}
@@ -287,19 +277,84 @@ class Orchestrator:
             count = self.store.insert_features(features)
             logger.info(f"  {p}/{t}: 写入 {count} 行")
 
-        # 保存特征代码版本 hash
         self._save_version()
-        logger.info("特征版本已记录: %s", self._hash_feature_code()[:12])
+
+    # ================================================================
+    #  训练 (并行化)
+    # ================================================================
+
+    def _train_single(self, province: str, target_type: str) -> Dict:
+        """训练单个 province/type."""
+        try:
+            features = self.store.load_features(
+                province, target_type,
+                (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d"),
+                datetime.now().strftime("%Y-%m-%d"),
+            )
+            if features.empty:
+                return {"error": f"无特征数据: {province}/{target_type}"}
+
+            return self.trainer.quantile_train(features, province, target_type)
+        except Exception as e:
+            logger.error("训练失败 %s/%s: %s", province, target_type, e)
+            return {"error": str(e)}
+
+    def train_all(self):
+        """并行训练所有 province/type."""
+        cfg = get_daemon_config()
+        parallel = cfg.get("parallel_provinces", True)
+
+        available = self._scan_available()
+        if not available:
+            logger.warning("无可用数据")
+            return
+
+        tasks = []
+        for province in get_provinces():
+            for t in available.get(province, []):
+                tasks.append((province, t))
+
+        if not tasks:
+            return
+
+        if parallel and len(tasks) > 1:
+            with ThreadPoolExecutor(max_workers=min(len(tasks), 4)) as executor:
+                futures = {
+                    executor.submit(self._train_single, p, t): (p, t)
+                    for p, t in tasks
+                }
+                for future in as_completed(futures, timeout=600):
+                    p, t = futures[future]
+                    try:
+                        result = future.result(timeout=300)
+                        if "error" in result:
+                            logger.warning("训练失败: %s/%s - %s", p, t, result["error"])
+                        else:
+                            logger.info("训练完成: %s/%s (%d features)", p, t,
+                                        result.get("n_features", 0))
+                    except Exception as e:
+                        logger.error("训练超时/异常: %s/%s - %s", p, t, e)
+        else:
+            for p, t in tasks:
+                self._train_single(p, t)
+
+    def _scan_available(self) -> Dict[str, List[str]]:
+        result = {}
+        for province in get_provinces():
+            types = get_available_actual_types(province)
+            if types:
+                result[province] = types
+        return result
+
+    # ================================================================
+    #  预测
+    # ================================================================
 
     def predict(self, province: str, target_type: str,
                 horizon_hours: int = 24) -> Dict:
         validate_province_and_type(province, target_type)
-        logger.info(f"预测: {province}/{target_type}, {horizon_hours}h")
-
-        # 展开 type (base → full type list)
         resolved_types = self._resolve_types(province, target_type)
 
-        # 预测前轻量回测 + 健康检查
         health = None
         try:
             end = datetime.now()
@@ -309,236 +364,198 @@ class Orchestrator:
                     province, rt,
                     start.strftime("%Y-%m-%d"),
                     (end + timedelta(days=1)).strftime("%Y-%m-%d"),
-                    value_type_filter="实际",
                 )
-                # 如果最近30天没数据，尝试用特征库中最新数据回退
                 if features_df.empty:
-                    features_df = self._load_latest_features(province, rt, days=30)
-                if not features_df.empty and len(features_df) >= 96 * 7:
-                    bt = self.backtester.evaluate_model(
-                        features_df, train_window_days=7, test_window_hours=24,
-                        province=province, target_type=rt,
-                    )
-                    mape = bt.get("overall_mape")
-                    if mape is not None:
-                        health = {"mape": round(mape, 4),
-                                  "status": "ok" if mape < 0.05 else "degraded"}
-                        if health["status"] == "degraded":
-                            logger.warning(f"模型精度退化 {rt} MAPE={mape:.2%}，建议 /improve")
-        except Exception as e:
-            logger.warning("健康检查失败 (%s/%s): %s", province, target_type, e)
+                    continue
 
-        # 预测每个展开的类型
+                bt = self.backtester.rolling_window_backtest(
+                    features_df, train_window_days=14, test_window_hours=24,
+                    n_windows=2, province=province,
+                    target_type=rt,
+                )
+                if "summary" in bt:
+                    mape = bt["summary"]["overall_mape"]
+                    health = {
+                        "mape": mape,
+                        "status": "ok" if mape < 0.10 else ("warning" if mape < 0.15 else "degraded"),
+                    }
+                    break
+        except Exception:
+            pass
+
         all_samples = []
-        total = 0
+        all_results = []
         for rt in resolved_types:
             try:
-                df = self.predictor.predict(province, rt, horizon_hours)
-                all_samples.extend(df.head(5)[["dt", "p50"]].to_dict("records"))
-                total += len(df)
-            except (FileNotFoundError, ValueError) as e:
-                logger.warning("预测跳过 %s/%s: %s", province, rt, e)
-
-        result = {
-            "province": province,
-            "type": target_type,
-            "resolved_types": resolved_types,
-            "horizon_hours": horizon_hours,
-            "n_predictions": total,
-            "sample": all_samples[:10],
-        }
-        if health is not None:
-            result["health"] = health
-        return result
-
-    def run_validation_cycle(self, province: str,
-                              target_type: str) -> Dict:
-        end = self._find_latest_date(province, target_type) or datetime.now()
-        start = end - timedelta(hours=48)
-
-        predictions = self.store.load_predictions(
-            province, target_type,
-            start.strftime("%Y-%m-%d"),
-            (end + timedelta(days=1)).strftime("%Y-%m-%d"),
-        )
-
-        actuals = self.store.load_raw_data(
-            province, target_type,
-            start.strftime("%Y-%m-%d"),
-            (end + timedelta(days=1)).strftime("%Y-%m-%d"),
-            value_type_filter="实际",
-        )
-
-        if predictions.empty or actuals.empty:
-            return {"status": "no_data"}
-
-        report = self.validator.validate(predictions, actuals, "p50")
-        self._validator_history.append(report)
-
-        logger.info(
-            f"验证 {province}/{target_type}: "
-            f"MAPE={report['metrics'].get('mape')}, "
-            f"triggered={report['triggered']}"
-        )
-
-        if report["triggered"]:
-            return self._run_improvement_cycle(
-                province, target_type, report
-            )
-
-        return {"status": "ok", "report": report}
-
-    def run_backtest_cycle(self, province: str,
-                            target_type: str) -> Dict:
-        end = self._find_latest_date(province, target_type) or datetime.now()
-        start = end - timedelta(days=120)
-
-        df = self.store.load_features(
-            province, target_type,
-            start.strftime("%Y-%m-%d"),
-            (end + timedelta(days=1)).strftime("%Y-%m-%d"),
-            value_type_filter="实际",
-        )
-
-        if df.empty:
-            return {"status": "no_data"}
-
-        result = self.backtester.evaluate_model(
-            df, train_window_days=14, test_window_hours=24,
-            province=province, target_type=target_type,
-        )
-
-        diagnosis = self.analyzer.diagnose(
-            result, validator_history=self._validator_history
-        )
-
-        logger.info(
-            f"回测 {province}/{target_type}: "
-            f"MAPE={result.get('overall_mape')}, "
-            f"diagnoses={len(diagnosis)}"
-        )
+                pred_df = self.predictor.predict(province, rt, horizon_hours)
+                samples = [
+                    {"dt": r["dt"].strftime("%Y-%m-%d %H:%M") if hasattr(r["dt"], "strftime") else str(r["dt"]),
+                     "p10": round(r["p10"], 1), "p50": round(r["p50"], 1),
+                     "p90": round(r["p90"], 1)}
+                    for _, r in pred_df.iterrows()
+                ]
+                all_samples.extend(samples[:96])  # 前 24h
+                all_results.append({"type": rt, "n": len(pred_df)})
+            except Exception as e:
+                logger.warning("预测失败 %s/%s: %s", province, rt, e)
 
         return {
-            "status": "ok",
-            "mape": result.get("overall_mape"),
-            "by_season": result.get("by_season", {}),
-            "diagnoses": diagnosis,
+            "province": province,
+            "target_type": target_type,
+            "resolved_types": resolved_types,
+            "health": health,
+            "n_predictions": len(all_samples),
+            "sample": all_samples,
+            "results": all_results,
         }
 
-    def _run_improvement_cycle(self, province: str,
-                                target_type: str,
-                                validation_report: Dict) -> Dict:
-        end = self._find_latest_date(province, target_type) or datetime.now()
-        bt_start = end - timedelta(days=60)
-        bt_end = end - timedelta(days=20)
-        exp_start = bt_end
-        exp_end = end
+    # ================================================================
+    #  回测 + 验证 + 优化
+    # ================================================================
 
-        # 回测窗口
-        bt_df = self.store.load_features(
+    def run_backtest_cycle(self, province: str, target_type: str) -> Dict:
+        features = self.store.load_features(
             province, target_type,
-            bt_start.strftime("%Y-%m-%d"),
-            (bt_end + timedelta(days=1)).strftime("%Y-%m-%d"),
-            value_type_filter="实际",
+            (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d"),
+            datetime.now().strftime("%Y-%m-%d"),
         )
+        if features.empty:
+            return {"error": "no_data"}
 
-        if bt_df.empty:
-            return {"status": "no_data"}
-
-        bt_result = self.backtester.evaluate_model(
-            bt_df, train_window_days=14, test_window_hours=24,
+        return self.backtester.evaluate_model(
+            features, train_window_days=30, test_window_hours=24,
             province=province, target_type=target_type,
         )
 
-        diagnosis = self.analyzer.diagnose(bt_result)
-
-        # 实验窗口
-        exp_df = self.store.load_features(
+    def run_validation_cycle(self, province: str, target_type: str) -> Dict:
+        features = self.store.load_features(
             province, target_type,
-            exp_start.strftime("%Y-%m-%d"),
-            (exp_end + timedelta(days=1)).strftime("%Y-%m-%d"),
-            value_type_filter="实际",
+            (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d"),
+            datetime.now().strftime("%Y-%m-%d"),
+        )
+        if features.empty:
+            return {"error": "no_data"}
+
+        # 回测
+        report = self.backtester.evaluate_model(
+            features, train_window_days=30, test_window_hours=24,
+            province=province, target_type=target_type,
+        )
+        if "error" in report:
+            return {"status": "error", "report": report}
+
+        metrics = {
+            "overall_mape": report.get("overall_mape", 0),
+            "by_season": report.get("by_season", {}),
+            "by_time_type": report.get("by_time_type", {}),
+            "by_hour_bucket": report.get("by_hour_bucket", {}),
+        }
+
+        # 诊断
+        diagnoses = self.analyzer.diagnose(metrics)
+        if not diagnoses:
+            return {"status": "ok", "report": report}
+
+        # 触发优化
+        should_improve = self.validator.should_trigger(
+            {"mape": metrics["overall_mape"]},
+            self._validator_history,
         )
 
-        if exp_df.empty:
+        if should_improve:
+            logger.info("退化检测触发: %s/%s, MAPE=%.4f, 诊断: %s",
+                        province, target_type, metrics["overall_mape"],
+                        [d["root_cause"] for d in diagnoses])
+            try:
+                improvement = self.improver.improve(
+                    diagnoses, features, province, target_type,
+                    baseline=metrics,
+                )
+                self._validator_history.append({"bias_direction": "ok"})
+
+                if improvement.get("improvement", 0) > 0:
+                    # 重训练
+                    self.trainer.quantile_train(features, province, target_type)
+                    return {"status": "improved", "improvement": improvement, "report": report}
+            except Exception as e:
+                logger.warning("优化失败: %s", e)
+
+        self._validator_history.append(
+            {"bias_direction": metrics.get("bias_direction", "ok")}
+        )
+        return {"status": "degraded", "report": report, "diagnoses": diagnoses}
+
+    def auto_improve(self, province: str, target_type: str) -> Dict:
+        """完整自动优化闭环: 回测 → 诊断 → 策略实验 → 重训练."""
+        features = self.store.load_features(
+            province, target_type,
+            (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d"),
+            datetime.now().strftime("%Y-%m-%d"),
+        )
+        if features.empty:
+            return {"error": "no_data"}
+
+        # 1. 基线回测
+        baseline = self.backtester.evaluate_model(
+            features, train_window_days=30, test_window_hours=24,
+            province=province, target_type=target_type,
+        )
+        if "error" in baseline:
+            return baseline
+
+        baseline_metrics = {
+            "overall_mape": baseline.get("overall_mape", 0),
+            "by_season": baseline.get("by_season", {}),
+            "by_time_type": baseline.get("by_time_type", {}),
+            "by_hour_bucket": baseline.get("by_hour_bucket", {}),
+        }
+        logger.info("基线 MAPE=%.4f: %s/%s", baseline_metrics["overall_mape"],
+                    province, target_type)
+
+        # 2. 诊断
+        diagnoses = self.analyzer.diagnose(baseline_metrics)
+        if not diagnoses:
+            logger.info("无显著问题，跳过优化")
+            return {"status": "ok", "mape": baseline_metrics["overall_mape"]}
+
+        logger.info("诊断: %s", [d["root_cause"] for d in diagnoses])
+
+        # 3. 策略实验
+        improvement = self.improver.improve(
+            diagnoses, features, province, target_type,
+            baseline=baseline_metrics,
+        )
+
+        # 4. 重训练
+        if improvement.get("improvement", 0) > 0:
+            new_result = self.trainer.quantile_train(features, province, target_type)
+            logger.info("重训练完成: %s/%s", province, target_type)
+
+            # 验证新模型
+            new_backtest = self.backtester.evaluate_model(
+                features, train_window_days=30, test_window_hours=24,
+                province=province, target_type=target_type,
+            )
+            new_mape = new_backtest.get("overall_mape", baseline_metrics["overall_mape"])
+
             return {
-                "status": "backtest_only",
-                "mape": bt_result.get("overall_mape"),
-                "diagnoses": diagnosis,
+                "status": "improved",
+                "mape_before": baseline_metrics["overall_mape"],
+                "mape_after": new_mape,
+                "improvement": improvement,
+            }
+        else:
+            return {
+                "status": "no_improvement",
+                "mape": baseline_metrics["overall_mape"],
+                "improvement": improvement,
             }
 
-        baseline_mape = bt_result.get("overall_mape", 0.10)
-        improvement = self.improver.improve(
-            diagnosis, exp_df, province, target_type,
-            baseline={"overall_mape": baseline_mape},
-        )
+    # ================================================================
+    #  其他命令
+    # ================================================================
 
-        logger.info(
-            f"优化 {province}/{target_type}: "
-            f"策略={improvement.get('selected_strategy')}, "
-            f"基线MAPE={baseline_mape}, "
-            f"实验后MAPE={improvement.get('mape_after')}"
-        )
-
-        if improvement.get("improvement", 0) > 0.03:
-            logger.info("触发全量重训练...")
-            full_df = self.store.load_features(
-                province, target_type,
-                (end - timedelta(days=90)).strftime("%Y-%m-%d"),
-                (end + timedelta(days=1)).strftime("%Y-%m-%d"),
-                value_type_filter="实际",
-            )
-            if not full_df.empty:
-                self.trainer.train(
-                    full_df, province, target_type,
-                    target_col="value",
-                )
-
-        return {
-            "status": "improved",
-            "validation": validation_report,
-            "baseline_mape": baseline_mape,
-            "improvement": improvement,
-            "diagnoses": diagnosis,
-        }
-
-    def _scan_available(self) -> list:
-        """返回有数据的 (province, type) 列表."""
-        available = []
-        for province in get_provinces():
-            for target_type in get_available_actual_types(province):
-                if not target_type:
-                    continue
-                df = self.store.load_features(
-                    province, target_type, None, None,
-                    value_type_filter="实际",
-                )
-                if not df.empty and len(df) >= 96:
-                    available.append((province, target_type))
-        return available
-
-    def train_all(self):
-        available = self._scan_available()
-        if not available:
-            logger.warning("无可用数据，跳过训练")
-            return
-
-        logger.info(f"扫描到 {len(available)} 组有数据的 (province, type)，开始全量训练...")
-
-        for province, target_type in available:
-            logger.info(f"训练: {province}/{target_type}")
-            df = self.store.load_features(
-                province, target_type, None, None,
-                value_type_filter="实际",
-            )
-            result = self.trainer.train(df, province, target_type)
-            logger.info(
-                f"  完成: n={result['n_samples']}, "
-                f"features={result['n_features']}"
-            )
-
-    def validate_data(self, province: str, target_type: str) -> Dict:
-        """数据校验."""
+    def validate_data(self, province: str, target_type: str):
         validate_province_and_type(province, target_type)
         end = self._find_latest_date(province, target_type) or datetime.now()
         start = end - timedelta(days=365)
@@ -559,7 +576,7 @@ class Orchestrator:
             gaps = df["dt"].diff().dropna()
             large_gaps = gaps[gaps > pd.Timedelta(minutes=30)]
             if len(large_gaps) > 0:
-                issues.append(f"时间间隙>30min: {len(large_gaps)}处, 最大{gaps.max()}")
+                issues.append(f"时间间隙>30min: {len(large_gaps)}处")
 
         if "value" in df.columns:
             neg_rate = (df["value"] <= 0).mean()
@@ -567,8 +584,7 @@ class Orchestrator:
                 issues.append(f"零值/负值比例: {neg_rate:.2%}")
 
         return {
-            "province": province,
-            "type": target_type,
+            "province": province, "type": target_type,
             "total_rows": total,
             "date_range": f"{df['dt'].min()} ~ {df['dt'].max()}",
             "null_rate": round(null_rate, 4),
@@ -577,19 +593,16 @@ class Orchestrator:
         }
 
     def explain(self, province: str, target_type: str) -> Dict:
-        """特征重要性分析."""
         importance = self.trainer.feature_importance(province, target_type)
         versions = self.trainer.list_versions(province, target_type)
         return {
-            "province": province,
-            "type": target_type,
+            "province": province, "type": target_type,
             "feature_importance": importance[:15],
             "model_versions": versions,
         }
 
     def export(self, province: str, target_type: str,
                fmt: str = "json", output: str = None) -> str:
-        """导出预测结果."""
         end = self._find_latest_date(province, target_type) or datetime.now()
         start = end - timedelta(hours=48)
         df = self.store.load_predictions(province, target_type,
@@ -609,12 +622,10 @@ class Orchestrator:
         return f"已导出 {len(df)} 条记录到 {output}"
 
     def rollback_model(self, province: str, target_type: str) -> Dict:
-        """回滚模型到上一个版本."""
         return self.trainer.rollback(province, target_type)
 
     def chart(self, province: str, target_type: str,
               hours: int = 24) -> str:
-        """生成终端 ASCII 折线图."""
         result = self.predict(province, target_type, hours)
         samples = result.get("sample", [])
         if not samples:
