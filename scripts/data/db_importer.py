@@ -221,6 +221,7 @@ class EnergyDBImporter:
                     chunk["hour"].astype(str).str.zfill(2) + ":" +
                     chunk["minute"].astype(str).str.zfill(2) + ":00"
                 )
+                chunk["power_value"] = chunk["power_value"].astype(float)
                 chunk = chunk.rename(columns={"power_value": "value"})
                 chunk = chunk[["dt", "province", "type", "value",
                                "_base", "_sub", "_value_type",
@@ -289,6 +290,7 @@ class EnergyDBImporter:
                     chunk["hour"].astype(str).str.zfill(2) + ":" +
                     chunk["minute"].astype(str).str.zfill(2) + ":00"
                 )
+                chunk["price_value"] = chunk["price_value"].astype(float)
                 chunk = chunk.rename(columns={"price_value": "value"})
                 chunk = chunk[["dt", "province", "type", "value",
                                "_sub", "price_market_id"]]

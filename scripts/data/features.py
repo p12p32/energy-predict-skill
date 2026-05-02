@@ -6,6 +6,7 @@ from scripts.core.config import parse_type, TypeInfo, get_cross_type_rules
 from scripts.data.holidays import add_holiday_features, add_cyclical_features, add_deep_calendar_features
 from scripts.data.quality import DataQuality
 from scripts.data.weather_features import WeatherFeatureEngineer
+from scripts.data.fetcher import WEATHER_ALL_COLS
 
 PREDICTION_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS energy_predictions (
@@ -101,10 +102,42 @@ DISTRIBUTED BY HASH (strategy_hash) BUCKETS 4;
 
 class FeatureEngineer:
     LAG_PERIODS = {
+        # 1 天 (96 步)
         "value_lag_1d": 96,
-        "value_lag_7d": 672,
         "value_diff_1d": 96,
+        # 2 天
+        "value_lag_2d": 192,
+        # 3 天
+        "value_lag_3d": 288,
+        # 4 天
+        "value_lag_4d": 384,
+        # 5 天
+        "value_lag_5d": 480,
+        # 6 天
+        "value_lag_6d": 576,
+        # 7 天 (672 步)
+        "value_lag_7d": 672,
         "value_diff_7d": 672,
+        # 14 天
+        "value_lag_14d": 1344,
+        # 21 天
+        "value_lag_21d": 2016,
+        # 28 天 (月周期)
+        "value_lag_28d": 2688,
+    }
+
+    # 多尺度滚动窗口 (步数)
+    ROLLING_WINDOWS = {
+        "value_rolling_mean_6h": (24, "mean"),
+        "value_rolling_mean_12h": (48, "mean"),
+        "value_rolling_mean_24h": (96, "mean"),
+        "value_rolling_mean_48h": (192, "mean"),
+        "value_rolling_mean_7d": (672, "mean"),
+        "value_rolling_std_24h": (96, "std"),
+        "value_rolling_std_7d": (672, "std"),
+        "value_rolling_max_24h": (96, "max"),
+        "value_rolling_min_24h": (96, "min"),
+        "value_rolling_range_24h": (96, "range"),
     }
 
     PRED_ERROR_LAGS = {
@@ -113,14 +146,34 @@ class FeatureEngineer:
     }
 
     def build_features_from_raw(self, raw: pd.DataFrame,
-                                value_type_filter: str = "实际") -> pd.DataFrame:
+                                value_type_filter: str = "实际",
+                                weather_df: pd.DataFrame = None) -> pd.DataFrame:
         """从原始数据构建特征.
 
         Args:
             raw: 原始数据 DataFrame
             value_type_filter: 只对此 value_type 的数据计算特征
+            weather_df: 外部气象数据 (15min 粒度, 含 dt/province 列),
+                        若提供则合并到 raw, 覆盖原有气象列
         """
         df = raw.copy()
+
+        # ── 合并外部气象数据 ──
+        if weather_df is not None and not weather_df.empty:
+            weather_cols = [c for c in weather_df.columns
+                           if c not in ("dt", "province") and c in WEATHER_ALL_COLS]
+            if weather_cols:
+                w_subset = weather_df[["dt", "province"] + weather_cols].copy()
+                if "dt" in df.columns and "province" in df.columns:
+                    df = df.merge(w_subset, on=["dt", "province"], how="left",
+                                  suffixes=("", "_w"))
+                    # 覆盖原有气象列
+                    for col in weather_cols:
+                        w_col = col + "_w" if col + "_w" in df.columns else col
+                        if w_col in df.columns and w_col != col:
+                            df[col] = df[w_col]
+                            df.drop(columns=[w_col], inplace=True, errors="ignore")
+
         df = df.sort_values(["province", "type", "dt"]).reset_index(drop=True)
 
         # ── type 三段式解析 ──
@@ -145,6 +198,15 @@ class FeatureEngineer:
                       3 if m in [9, 10, 11] else 4
         )
 
+        # ── 气象缺失填充 (季节+小时统计均值, 而非 0) ──
+        weather_cols = ["temperature", "humidity", "wind_speed", "wind_direction",
+                       "solar_radiation", "precipitation", "pressure"]
+        for col in weather_cols:
+            if col in df.columns and df[col].isna().any():
+                grp = df.groupby(["season", "hour"])[col].transform("mean")
+                df[col] = df[col].fillna(grp)
+                df[col] = df[col].fillna(df[col].mean())
+
         # ── 深度天气特征 ──
         wfe = WeatherFeatureEngineer()
         df = wfe.transform(df)
@@ -164,7 +226,7 @@ class FeatureEngineer:
         df["weekend_hour"] = df["is_weekend"].astype(int) * df["hour"]
         df["dow_hour"] = df["day_of_week"] * 24 + df["hour"]
 
-        # ── 滞后特征 (只在 实际 数据上计算，避免预测数据污染) ──
+        # ── 滞后特征 (只在 实际 数据上计算) ──
         actual_mask = df["value_type"] == value_type_filter
         for group_key, group_df in df[actual_mask].groupby(["province", "type"]):
             idx = group_df.index
@@ -174,11 +236,31 @@ class FeatureEngineer:
                 else:
                     df.loc[idx, col_name] = group_df["value"].shift(shift_n)
 
-            df.loc[idx, "value_rolling_mean_24h"] = (
-                group_df["value"].rolling(window=96, min_periods=1).mean().values
-            )
+            # 多尺度滚动统计
+            for feat_name, (win_size, win_func) in self.ROLLING_WINDOWS.items():
+                if feat_name == "value_rolling_range_24h":
+                    continue  # 后面单独算
+                if win_func == "std":
+                    df.loc[idx, feat_name] = (
+                        group_df["value"].rolling(window=win_size, min_periods=1).std().values
+                    )
+                elif win_func == "mean":
+                    df.loc[idx, feat_name] = (
+                        group_df["value"].rolling(window=win_size, min_periods=1).mean().values
+                    )
+                elif win_func == "max":
+                    df.loc[idx, feat_name] = (
+                        group_df["value"].rolling(window=win_size, min_periods=1).max().values
+                    )
+                elif win_func == "min":
+                    df.loc[idx, feat_name] = (
+                        group_df["value"].rolling(window=win_size, min_periods=1).min().values
+                    )
+                elif win_func == "range":
+                    roll = group_df["value"].rolling(window=win_size, min_periods=1)
+                    df.loc[idx, feat_name] = (roll.max() - roll.min()).values
 
-        # ── 滞后交互特征 ──
+        # 滞后交互特征 ──
         if "value_lag_7d" in df.columns:
             df["weekend_x_lag7d"] = df["is_weekend"].astype(int) * df["value_lag_7d"]
         if "hour" in df.columns and "value_lag_1d" in df.columns:
@@ -200,13 +282,124 @@ class FeatureEngineer:
                 df.loc[idx, "value_rolling_max_24h"] - df.loc[idx, "value_rolling_min_24h"]
             )
 
-        # ── 天气×时间交互 ──
+        # ── 滞后交互特征 ──
+        if "value_lag_7d" in df.columns:
+            df["weekend_x_lag7d"] = df["is_weekend"].astype(int) * df["value_lag_7d"]
+        if "hour" in df.columns and "value_lag_1d" in df.columns:
+            df["hour_x_lag1d"] = df["hour"] * df["value_lag_1d"]
+        # 周/月周期差异
+        if "value_lag_7d" in df.columns and "value_lag_28d" in df.columns:
+            df["weekly_vs_monthly"] = df["value_lag_7d"] - df["value_lag_28d"]
+
+        # ── 天气×时间交互 (增强版) ──
         if "temperature" in df.columns and "hour" in df.columns:
             df["temp_x_hour"] = df["temperature"] * df["hour"]
+            if "peak_valley" in df.columns:
+                df["temp_x_peak"] = df["temperature"] * df["peak_valley"]
+            if "is_weekend" in df.columns:
+                df["temp_x_weekend"] = df["temperature"] * df["is_weekend"].astype(int)
         if "wind_speed" in df.columns and "season" in df.columns:
             df["wind_x_season"] = df["wind_speed"] * df["season"]
         if "temperature" in df.columns and "humidity" in df.columns:
             df["temp_x_humidity"] = df["temperature"] * df["humidity"] / 100
+        if "solar_radiation" in df.columns and "season" in df.columns:
+            df["solar_x_season"] = df["solar_radiation"] * df["season"]
+        if "precipitation" in df.columns and "temperature" in df.columns:
+            df["rain_x_temp"] = df["precipitation"] * df["temperature"]
+
+        # ── 风电专项特征 ──
+        if "wind_speed_10m" in df.columns:
+            ws = df["wind_speed_10m"]
+            # 风切变指数 (10m vs 100m)
+            if "wind_speed_100m" in df.columns:
+                ws100 = df["wind_speed_100m"]
+                df["wind_shear"] = np.where(
+                    ws > 0.1,
+                    np.log(np.maximum(ws100, 0.01) / np.maximum(ws, 0.01)) / np.log(10),
+                    0.0
+                )
+            # 阵风系数
+            if "wind_gusts" in df.columns:
+                df["gust_factor"] = np.where(
+                    ws > 0.5,
+                    df["wind_gusts"] / ws,
+                    0.0
+                )
+            # 风速立方 (风能 ∝ v³)
+            df["wind_power"] = ws ** 3
+            # 有效风速标记 (切出风速以上, 切入风速以下)
+            df["wind_effective"] = ((ws >= 3) & (ws <= 25)).astype(float) * ws
+            # 风向稳定性 (24h 内风向标准差)
+            if "wind_direction_10m" in df.columns:
+                wd = df["wind_direction_10m"]
+                # 风向环形标准差
+                sin_wd = np.sin(np.radians(wd))
+                cos_wd = np.cos(np.radians(wd))
+                df["wind_dir_var"] = 1.0 - np.sqrt(sin_wd ** 2 + cos_wd ** 2)
+
+        # ── 光伏专项特征 ──
+        if "shortwave_radiation" in df.columns:
+            ghi = df["shortwave_radiation"]
+            # 日间活跃标记 (核心特征: 让模型学会夜间出力=0)
+            df["solar_active"] = (df["hour"].isin(range(6, 20)) & (ghi > 10)).astype(float)
+            # 太阳高度角近似 (用 hour 余弦)
+            if "hour" in df.columns:
+                # 简化太阳高度角: 正午最高(1), 夜间最低(0)
+                df["solar_elevation"] = np.maximum(np.cos(np.abs(df["hour"] - 12) / 12 * np.pi), 0) ** 2
+            # ── 光伏物理基准线 (GHI → 出力的非线性映射) ──
+            # 理论: 出力 = 装机容量 × GHI/1000 × PR × 温度系数
+            # 这里用历史 GHI 和出力拟合一个简单映射, 作为基准特征
+            # 实际值/GHI 比 = "单位辐照出力效率"
+            if actual_mask.any() and "value" in df.columns:
+                for group_key, group_df in df[actual_mask].groupby(["province", "type"]):
+                    idx = group_df.index
+                    ghi_vals = group_df["shortwave_radiation"].values
+                    val_vals = group_df["value"].values
+                    # 单位辐照出力效率 (MW per W/m²)
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        eff = np.where(ghi_vals > 10, val_vals / ghi_vals, np.nan)
+                    # 用滚动中位数作为效率基线 (减少异常值影响)
+                    eff_series = pd.Series(eff, index=idx)
+                    eff_baseline = eff_series.rolling(window=672, min_periods=96).median()
+                    # 效率基线外推
+                    eff_median = eff_baseline.dropna().median()
+                    eff_filled = eff_baseline.fillna(eff_median)
+                    df.loc[idx, "pv_efficiency_baseline"] = eff_filled.values
+                    # 物理基准出力 = GHI × 效率基线
+                    df.loc[idx, "pv_physical_baseline"] = ghi_vals * eff_filled.values
+            # 温度系数 (温度越高, 光伏效率越低, 约 -0.4%/°C)
+            if "temperature" in df.columns:
+                df["pv_temp_coeff"] = ghi * (1 - 0.004 * np.maximum(df["temperature"] - 25, 0))
+            # DNI/DHI 比值 (晴空指数)
+            if "dni" in df.columns and "dhi" in df.columns:
+                total = df["dni"] + df["dhi"]
+                df["clear_sky_index"] = np.where(total > 1, df["dni"] / total, 0)
+            # 云量对辐照的衰减
+            if "cloud_cover" in df.columns:
+                df["cloud_attenuation"] = ghi * (1 - df["cloud_cover"] / 100.0)
+            # 日照强度分级
+            df["solar_bin"] = pd.cut(ghi, bins=[-1, 0, 100, 400, 800, 2000],
+                                       labels=[0, 1, 2, 3, 4]).astype(float)
+            # ── 新增: 光伏出力物理模型特征 ──
+            # GHI 平方根 (出力 ∝ sqrt(辐照), 非线性)
+            df["ghi_sqrt"] = np.sqrt(np.maximum(ghi, 0))
+            # DHI 主导度 (DHI/GHI, 高值=多云天气, 出力更平滑)
+            if "dhi" in df.columns:
+                df["dhi_dominance"] = np.where(ghi > 1, df["dhi"] / ghi, 0)
+            # 云量二次衰减 (云量对出力的非线性影响)
+            if "cloud_cover" in df.columns:
+                cc = df["cloud_cover"] / 100.0
+                df["cloud_nonlinear"] = ghi * (1 - cc ** 1.5)
+            # 辐照 × cos(天顶角近似: 用 hour_cos 近似)
+            if "hour_cos" in df.columns:
+                df["ghi_x_cos"] = ghi * np.maximum(df["hour_cos"], 0)
+            # 预报时间窗口内累计辐照 (6h 窗口)
+            if actual_mask.any():
+                for group_key, group_df in df[actual_mask].groupby(["province", "type"]):
+                    idx = group_df.index
+                    df.loc[idx, "solar_cumsum_6h"] = (
+                        group_df["shortwave_radiation"].rolling(window=24, min_periods=1).sum().values
+                    )
 
         # ── 初始化 pred_error 列为 0 (后续由 add_prediction_error_features 填充) ──
         for col in ["pred_error", "pred_error_lag_1d", "pred_error_lag_7d",
