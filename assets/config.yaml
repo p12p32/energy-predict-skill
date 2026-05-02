@@ -1,6 +1,13 @@
 # config.yaml — 全局配置
-data_source: "file"               # file(零依赖) | memory(临时) | doris(生产)
+data_source: "file"               # file(零依赖) | memory(临时) | mysql(生产)
 watch_dir: ""                     # file 模式监控目录 (daemon 自动扫描新 CSV)
+
+mysql:
+  host: "127.0.0.1"
+  port: 3306
+  user: "root"
+  password: "root123456"
+  database: "electric_power_db"
 
 doris:
   host: "127.0.0.1"
@@ -39,10 +46,11 @@ provinces:
   - 浙江
   - 河南
 
+# 基类类型（前缀校验，支持子类型）
 types:
-  - output
-  - load
-  - price
+  - 出力
+  - 负荷
+  - 电价
 
 province_coords:
   广东: { lat: 23.13, lon: 113.26 }
@@ -52,3 +60,90 @@ province_coords:
   山东: { lat: 36.67, lon: 116.98 }
   浙江: { lat: 30.27, lon: 120.15 }
   河南: { lat: 34.77, lon: 113.65 }
+
+# 值类型映射
+value_types:
+  actual: 实际
+  predicted: 预测
+  default: 实际
+
+# 每个子类型需要的特征列，AI 据此搜索外部数据
+type_features:
+  出力_风电:
+    critical: [wind_speed, wind_direction, pressure]
+    optional: [temperature]
+  出力_光伏:
+    critical: [solar_radiation, temperature]
+    optional: [cloud_cover, humidity]
+  出力_水电:
+    critical: [precipitation]
+    optional: [river_flow, reservoir_level]
+  出力_火电:
+    critical: [coal_price]
+    optional: [carbon_price, maintenance_schedule]
+  出力_核电:
+    critical: [maintenance_schedule]
+    optional: []
+  出力_总:
+    critical: [wind_speed, solar_radiation, precipitation, coal_price]
+    optional: [carbon_price]
+  负荷_工业:
+    critical: [temperature, industrial_output]
+    optional: [coal_price]
+  负荷_居民:
+    critical: [temperature, humidity]
+    optional: [holiday_impact]
+  负荷_商业:
+    critical: [temperature, humidity]
+    optional: [holiday_impact]
+  负荷_农业:
+    critical: [precipitation, season]
+    optional: [temperature]
+  负荷_总:
+    critical: [temperature, humidity]
+    optional: [industrial_output, holiday_impact]
+  电价_日前:
+    critical: [coal_price, carbon_price, supply_demand_ratio]
+    optional: [temperature]
+  电价_实时:
+    critical: [load_prediction_error, output_deviation]
+    optional: [grid_congestion, coal_price]
+  电价_中长期:
+    critical: [coal_price, carbon_price]
+    optional: [renewable_penetration]
+
+# 跨类型交互规则 — 控制 add_cross_type_features_v2
+cross_type_rules:
+  # 出力子类型之间的物理约束: 总出力 = 各子类之和
+  output_siblings:
+    - 出力_风电
+    - 出力_光伏
+    - 出力_水电
+    - 出力_火电
+    - 出力_核电
+    - 出力_总
+  # 负荷子类型之间
+  load_siblings:
+    - 负荷_工业
+    - 负荷_居民
+    - 负荷_商业
+    - 负荷_农业
+    - 负荷_总
+  # 电价子类型
+  price_siblings:
+    - 电价_日前
+    - 电价_实时
+  # 派生交互
+  derived:
+    - name: residual_demand
+      formula: "load_total - output_wind - output_solar"
+      description: "火电必须补充的缺口(边际调节者)"
+    - name: renewable_penetration
+      formula: "(output_wind + output_solar) / output_total"
+      description: "可再生占比 → 火电空间被挤占"
+    - name: thermal_marginal_cost
+      formula: "coal_price * 0.35"
+      description: "度电煤耗约 350g 标煤 → 火电边际成本"
+    - name: price_pressure_index
+      formula: "supply_demand_ratio * coal_price"
+      description: "供需紧张 + 煤价高 → 电价上行压力"

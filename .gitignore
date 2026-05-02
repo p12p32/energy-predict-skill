@@ -6,3 +6,4 @@ models/
 *.pkl
 .energy_data/
 benchmark_report.json
+/data/

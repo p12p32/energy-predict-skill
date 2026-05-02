@@ -12,7 +12,7 @@ from scripts.ml.trend import TrendModel
 from scripts.ml.error_correction import ErrorCorrectionModel
 from scripts.data.features import FeatureStore
 from scripts.data.fetcher import DataFetcher
-from scripts.core.config import load_config, validate_province_and_type
+from scripts.core.config import load_config, validate_province_and_type, parse_type
 
 
 class Predictor:
@@ -28,14 +28,42 @@ class Predictor:
         """price 类型允许负值预测 (山东电力市场可能出现负电价)."""
         return target_type == "price"
 
+    def _find_latest_date(self, province: str, target_type: str):
+        """扫描特征库，返回该 province/type 的最新数据日期."""
+        import glob, os
+        base_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            ".energy_data", "features",
+        )
+        pattern = os.path.join(base_dir, f"{province}_{target_type}_*.parquet")
+        files = sorted(glob.glob(pattern))
+        if not files:
+            return None
+        # 读取最后一个文件的最新日期
+        try:
+            df = pd.read_parquet(files[-1], columns=["dt"])
+            if not df.empty:
+                return pd.to_datetime(df["dt"].max())
+        except Exception:
+            pass
+        return None
+
     def predict(self, province: str, target_type: str,
                 horizon_hours: int = 24,
-                model_version: str = None) -> pd.DataFrame:
+                model_version: str = None,
+                reference_date: str = None) -> pd.DataFrame:
         validate_province_and_type(province, target_type)
         horizon_steps = horizon_hours * 4
 
         lookback_days = 14
-        end_date = datetime.now()
+        if reference_date:
+            end_date = pd.to_datetime(reference_date)
+        else:
+            # 自动探测: 用特征库中最新日期
+            end_date = self._find_latest_date(province, target_type)
+            if end_date is None:
+                end_date = datetime.now()
+
         start_date = end_date - timedelta(days=lookback_days)
 
         history = self.store.load_features(
@@ -164,6 +192,7 @@ class Predictor:
         last_row = history.iloc[-1].copy()
         last_value = last_row.get("value", 0)
         last_price = last_row.get("price", 0)
+        ti = parse_type(target_type)
         future_times = pd.date_range(
             start=base_dt + timedelta(minutes=15),
             periods=horizon_steps,
@@ -173,6 +202,8 @@ class Predictor:
         for i, ft in enumerate(future_times):
             row = {
                 "dt": ft, "province": province, "type": target_type,
+                "sub_type": ti.sub or "",
+                "value_type": ti.value_type,
                 "value": None, "price": last_price,
                 "hour": ft.hour, "day_of_week": ft.dayofweek,
                 "day_of_month": ft.day, "month": ft.month,

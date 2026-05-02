@@ -5,7 +5,9 @@ description: Use when users ask for electricity load forecasting, power output p
 
 # 电力预测 Skill
 
-LightGBM 分位数回归 + 自进化闭环。覆盖 7 省 × 3 类型（出力/负荷/电价）。
+LightGBM 分位数回归 + 自进化闭环。覆盖 7 省 × 多重类型（出力/负荷/电价 × 子类型 × 实际/预测）。
+
+Type 三段式: `{基类}_{子类型}_{值类型}`，如 `出力_风电_实际`、`电价_日前_预测`、`出力`(默认=出力_总_实际)。
 
 ## Setup（自动）
 
@@ -54,6 +56,8 @@ fi
 | `/daemon <start\|once>` | 自动调度引擎 |
 
 **类型映射:** 出力→output, 负荷→load, 电价→price
+**子类型:** 风电/光伏/水电/火电/核电/日前/实时/工业/居民/... (可选)
+**值类型:** 实际/预测 (默认实际)
 **时间映射:** N小时→N, N天→N×24, 下周→168
 
 ## When to Use
@@ -181,7 +185,49 @@ python3 -c "from scripts.core.data_source import FileSource; import json; print(
 2. 经济列 (coal_price/carbon_price/price) — 哪个缺？
 3. 缺什么补什么，补全后重新 `/import`
 
-**可用工具：** `scripts/data/fetcher.py` 提供 Open-Meteo 气象数据获取。AI 也可使用自己的数据源。CSV 是唯一接口。
+**可用工具：** `scripts/data/fetcher.py` 提供 Open-Meteo 气象数据获取。AI 也可使用自己的数据源。
+
+### 数据库模式 (生产)
+
+设置 `data_source: mysql` 可直接连接 MySQL/Doris，使用 `EnergyDBImporter` 一键导入：
+
+```bash
+# 方式1: 直接导出 CSV (然后 /import 消费)
+python3 scripts/data/db_importer.py --export
+
+# 方式2: 查看数据概要
+python3 scripts/data/db_importer.py --summary
+
+# 方式3: 代码调用
+python3 -c "
+from scripts.data.db_importer import EnergyDBImporter
+imp = EnergyDBImporter()
+# 按省份/日期范围导出
+imp.export_to_csv(province='四川', start_date='2025-01-01', end_date='2025-06-30')
+"
+```
+
+**维度映射:**
+
+| 维度表 | 字段 | 映射 |
+|--------|------|------|
+| `t_data_quality` | quality_id=1 | 出力_预测 |
+| | quality_id=2 | 出力_实际 |
+| | quality_id=3 | 负荷_预测 |
+| | quality_id=4 | 负荷_实际 |
+| `t_power_source` | power_source_id=3 | 风电 |
+| | 4 | 光伏 |
+| | 5 | 水电 |
+| | 6 | 水电含抽蓄 |
+| | 7 | 核电 |
+| | 8 | 火电 |
+| | 1 | 总 |
+| `t_price_market` | price_market_id=1 | 日前 |
+| | 2 | 实时 |
+| | 4 | 日前出清 |
+| | 5 | 实时出清 |
+
+> **电价特殊性**: `f_price_15min` 没有 `data_quality_id`，所有电价数据都是实际交易价格（value_type=实际），不区分预测/实际。
 
 ## /backtest <省份> <类型>
 
@@ -284,14 +330,35 @@ python3 tests/benchmark.py
 ## Data Flow
 
 ```
-AI 搜索/采集外部数据 → 构造 CSV → /import
-  → FileSource.import_csv() → FeatureEngineer → FeatureStore
-  → Trainer.train() → models/*.lgb
-  → Predictor.predict() → P10/P50/P90 + ECM 残差修正
-  → Validator → 退化检测 → Improver → 重训 → 新模型部署
+数据源 (三选一):
+  CSV   → FileSource.import_csv()
+  MySQL → DorisDB.query()  (Doris 兼容 MySQL 协议)
+  Doris → DorisDB.query()
+    │
+    ├─ f_power_15min → data_quality_id 决定 (基类, 值类型)
+    │                   power_source_id  决定 子类型
+    └─ f_price_15min → price_market_id  决定 子类型
+    │
+    ▼
+Type 解析: "出力_风电_实际" → (base=出力, sub=风电, vt=实际)
+    │
+    ▼
+FeatureEngineer: vt=实际 参与训练, vt=预测 用于误差特征
+    │
+    ▼
+Trainer → models/*.lgbm  (每个 (province, base_sub) 独立模型)
+    │
+    ▼
+Predictor → P10/P50/P90 + ECM 残差修正
+    │
+    ▼
+当预测到期、实际值到达:
+  predictions(p50) + actuals(value) → pred_error 特征
+  → 下一次训练输入 → 模型知道"我在什么情况下会犯错"
+    │
+    ▼
+Validator → 退化检测 → Improver → 重训 → 新模型部署
 ```
-
-**AI 的职责是丰富特征维度；scripts/ 只负责处理，不负责获取外部数据。**
 
 ## Sub-Skills
 

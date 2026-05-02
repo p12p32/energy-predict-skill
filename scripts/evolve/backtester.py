@@ -154,8 +154,15 @@ class Backtester:
         }
 
     @staticmethod
-    def _calc_mape(actuals: np.ndarray, predictions: np.ndarray) -> float:
-        mask = actuals != 0
-        if mask.sum() == 0:
-            return 0.0
-        return float(np.mean(np.abs((actuals[mask] - predictions[mask]) / actuals[mask])))
+    def _calc_mape(actuals: np.ndarray, predictions: np.ndarray,
+                   min_abs_value: float = 0.0) -> float:
+        """sMAPE (symmetric MAPE) — 对接近0的值更鲁棒, 范围 [0, 200%]."""
+        denom = (np.abs(actuals) + np.abs(predictions)) / 2
+        mask = denom > max(1e-8, min_abs_value / 2)
+        if mask.sum() < 10:
+            # 回退: 传统 MAPE (仅过滤exact 0)
+            mask2 = np.abs(actuals) > 1e-8
+            if mask2.sum() < 10:
+                return 0.0
+            return float(np.mean(np.abs((actuals[mask2] - predictions[mask2]) / actuals[mask2])))
+        return float(np.mean(np.abs(actuals[mask] - predictions[mask]) / denom[mask]))

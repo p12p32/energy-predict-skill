@@ -8,13 +8,24 @@
 """
 import os
 import json
-import pickle
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Dict, List, Optional
 
 import pandas as pd
 import numpy as np
+
+from scripts.core.config import parse_type
+
+
+def _filter_by_value_type(df: pd.DataFrame, value_type: Optional[str] = None) -> pd.DataFrame:
+    """按 value_type 过滤 DataFrame. 解析 type 列的三段式结构."""
+    if value_type is None or df.empty or "type" not in df.columns:
+        return df
+    mask = df["type"].apply(
+        lambda t: parse_type(str(t)).value_type == value_type
+    )
+    return df[mask].reset_index(drop=True)
 
 
 class DataSource(ABC):
@@ -23,7 +34,8 @@ class DataSource(ABC):
     @abstractmethod
     def load_raw(self, province: str, data_type: str,
                  start_date: str, end_date: str,
-                 table: str = "energy_raw") -> pd.DataFrame:
+                 table: str = "energy_raw",
+                 value_type_filter: Optional[str] = None) -> pd.DataFrame:
         ...
 
     @abstractmethod
@@ -32,7 +44,8 @@ class DataSource(ABC):
 
     @abstractmethod
     def load_features(self, province: str, data_type: str,
-                      start_date: str, end_date: str) -> pd.DataFrame:
+                      start_date: str, end_date: str,
+                      value_type_filter: Optional[str] = None) -> pd.DataFrame:
         ...
 
     @abstractmethod
@@ -41,7 +54,8 @@ class DataSource(ABC):
 
     @abstractmethod
     def load_predictions(self, province: str, data_type: str,
-                         start_date: str, end_date: str) -> pd.DataFrame:
+                         start_date: str, end_date: str,
+                         value_type_filter: Optional[str] = None) -> pd.DataFrame:
         ...
 
     @abstractmethod
@@ -93,7 +107,8 @@ class FileSource(DataSource):
 
     def load_raw(self, province: str, data_type: str,
                  start_date: str, end_date: str,
-                 table: str = "energy_raw") -> pd.DataFrame:
+                 table: str = "energy_raw",
+                 value_type_filter: Optional[str] = None) -> pd.DataFrame:
         path = os.path.join(self.base_dir, "raw", f"{province}_{data_type}.csv")
         if not os.path.exists(path):
             path = os.path.join(self.base_dir, "raw", f"{province}.csv")
@@ -113,7 +128,9 @@ class FileSource(DataSource):
         start_dt = pd.to_datetime(start_date)
         end_dt = pd.to_datetime(end_date)
         mask = (df["dt"] >= start_dt) & (df["dt"] < end_dt)
-        return df[mask].sort_values("dt").reset_index(drop=True)
+        df = df[mask].sort_values("dt").reset_index(drop=True)
+
+        return _filter_by_value_type(df, value_type_filter)
 
     def import_csv(self, filepath: str) -> Dict:
         """导入 CSV 到 raw 目录。返回列信息供 AI 自行判断维度覆盖."""
@@ -180,7 +197,8 @@ class FileSource(DataSource):
             os.remove(f)
 
     def load_features(self, province: str, data_type: str,
-                      start_date: str = None, end_date: str = None) -> pd.DataFrame:
+                      start_date: str = None, end_date: str = None,
+                      value_type_filter: Optional[str] = None) -> pd.DataFrame:
         import glob
         pattern = os.path.join(self.base_dir, "features", f"{province}_{data_type}_*.parquet")
         files = sorted(glob.glob(pattern))
@@ -201,7 +219,8 @@ class FileSource(DataSource):
         if not frames:
             return pd.DataFrame()
         result = pd.concat(frames, ignore_index=True)
-        return result.drop_duplicates(subset=["dt"]).sort_values("dt").reset_index(drop=True)
+        result = result.drop_duplicates(subset=["dt"]).sort_values("dt").reset_index(drop=True)
+        return _filter_by_value_type(result, value_type_filter)
 
     # ── Predictions ──
 
@@ -218,7 +237,8 @@ class FileSource(DataSource):
         return len(df)
 
     def load_predictions(self, province: str, data_type: str,
-                         start_date: str, end_date: str) -> pd.DataFrame:
+                         start_date: str, end_date: str,
+                         value_type_filter: Optional[str] = None) -> pd.DataFrame:
         import glob
         pattern = os.path.join(self.base_dir, "predictions", f"{province}_{data_type}_*_pred.parquet")
         files = sorted(glob.glob(pattern))
@@ -233,7 +253,8 @@ class FileSource(DataSource):
         start_dt = pd.to_datetime(start_date)
         end_dt = pd.to_datetime(end_date)
         mask = (result["dt"] >= start_dt) & (result["dt"] < end_dt)
-        return result[mask].sort_values("dt").reset_index(drop=True)
+        result = result[mask].sort_values("dt").reset_index(drop=True)
+        return _filter_by_value_type(result, value_type_filter)
 
     # ── Knowledge ──
 
@@ -281,14 +302,16 @@ class MemorySource(DataSource):
 
     def load_raw(self, province: str, data_type: str,
                  start_date: str, end_date: str,
-                 table: str = "energy_raw") -> pd.DataFrame:
+                 table: str = "energy_raw",
+                 value_type_filter: Optional[str] = None) -> pd.DataFrame:
         key = f"{province}_{data_type}"
         df = self._raw.get(key, pd.DataFrame())
         if df.empty:
             return df
         df["dt"] = pd.to_datetime(df["dt"])
         mask = (df["dt"] >= pd.to_datetime(start_date)) & (df["dt"] < pd.to_datetime(end_date))
-        return df[mask].sort_values("dt").reset_index(drop=True)
+        df = df[mask].sort_values("dt").reset_index(drop=True)
+        return _filter_by_value_type(df, value_type_filter)
 
     def save_features(self, df: pd.DataFrame) -> int:
         for (province, dtype), group in df.groupby(["province", "type"]):
@@ -298,7 +321,8 @@ class MemorySource(DataSource):
         return len(df)
 
     def load_features(self, province: str, data_type: str,
-                      start_date: str = None, end_date: str = None) -> pd.DataFrame:
+                      start_date: str = None, end_date: str = None,
+                      value_type_filter: Optional[str] = None) -> pd.DataFrame:
         key = f"{province}_{data_type}"
         df = self._features.get(key, pd.DataFrame())
         if df.empty:
@@ -308,7 +332,8 @@ class MemorySource(DataSource):
             start_dt = pd.to_datetime(start_date or "2000-01-01")
             end_dt = pd.to_datetime(end_date or "2100-01-01")
             df = df[(df["dt"] >= start_dt) & (df["dt"] < end_dt)]
-        return df.sort_values("dt").reset_index(drop=True)
+        df = df.sort_values("dt").reset_index(drop=True)
+        return _filter_by_value_type(df, value_type_filter)
 
     def save_predictions(self, df: pd.DataFrame) -> int:
         date_str = datetime.now().strftime("%Y%m%d")
@@ -317,14 +342,16 @@ class MemorySource(DataSource):
         return len(df)
 
     def load_predictions(self, province: str, data_type: str,
-                         start_date: str, end_date: str) -> pd.DataFrame:
+                         start_date: str, end_date: str,
+                         value_type_filter: Optional[str] = None) -> pd.DataFrame:
         dfs = []
         for key, df in self._predictions.items():
             if key.startswith(f"{province}_{data_type}"):
                 dfs.append(df)
         if not dfs:
             return pd.DataFrame()
-        return pd.concat(dfs, ignore_index=True)
+        result = pd.concat(dfs, ignore_index=True)
+        return _filter_by_value_type(result, value_type_filter)
 
     def save_knowledge(self, data: Dict) -> None:
         self._knowledge.append(data)

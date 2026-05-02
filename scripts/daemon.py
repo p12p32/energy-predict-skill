@@ -1,18 +1,28 @@
-"""daemon.py — 自动调度引擎 (Watcher 驱动)
+"""daemon.py — 单次调度入口 (cron / AI 按需调用)
 
-持续运行: 数据进来 → 构建特征 → 预测 → 验证 → 退化→优化 → 下一轮.
-不再盲睡, 而是等新数据到达才触发流水线.
+设计原则: 不做常驻轮询。日常由 cron 定时触发，AI 在需要时手动调用。
+流程: build_features → train_all → predict_all → validate → 退出.
 """
 import logging
-import signal
+import os
 import sys
-import time
-from datetime import datetime, timedelta
-from typing import Dict, List
+
+# --crontab 模式不依赖项目模块，提前处理
+if "--crontab" in sys.argv:
+    script = os.path.abspath(__file__)
+    proj_dir = os.path.dirname(os.path.dirname(__file__))
+    print("# 能源预测调度 — crontab 模板")
+    print(f"# 日常增量运行 (每天凌晨 6:00)")
+    print(f"0 6 * * * cd {proj_dir} && python {script}")
+    print()
+    print(f"# 周度全量重建 (每周日 4:00, 合并碎片文件)")
+    print(f"0 4 * * 0 cd {proj_dir} && python {script} --force-rebuild")
+    print()
+    print(f"# 如果数据在凌晨 3:00 到库, 给 3 小时容错; 按实际情况调整")
+    sys.exit(0)
 
 from scripts.orchestrator import Orchestrator
-from scripts.data_watcher import DataWatcher
-from scripts.core.config import get_provinces, get_types, load_config
+from scripts.core.config import get_provinces, get_available_types, load_config
 from scripts.core.monitoring import MonitoringServer, record_prediction
 
 logging.basicConfig(
@@ -27,193 +37,94 @@ logger = logging.getLogger("daemon")
 
 
 class Daemon:
-    def __init__(self, interval_minutes: int = 15):
+    def __init__(self):
         self.orch = Orchestrator()
-        self.watcher = DataWatcher(self.orch.store.source)
-        self.interval = timedelta(minutes=interval_minutes)
-        self.running = False
-        self.rounds: Dict[str, int] = {}
-        self.last_mape: Dict[str, float] = {}
-        self.last_predict: Dict[str, datetime] = {}
-        self._monitor: MonitoringServer = None
+        self.force_rebuild_features: bool = False
+        self.last_mape: dict = {}
+        self._monitor = None
 
-    def start(self, once: bool = False):
-        self.running = True
-        signal.signal(signal.SIGINT, self._handle_stop)
-        signal.signal(signal.SIGTERM, self._handle_stop)
-
+    def run(self):
         cfg = load_config()
         ds_type = cfg.get("data_source", "file")
-        watch_dir = cfg.get("watch_dir", "")
 
         logger.info("=" * 50)
         logger.info(f"能源预测引擎 启动 (数据源: {ds_type})")
-        logger.info(f"覆盖 {len(get_provinces())} 省 × {len(get_types())} 类型")
+        logger.info(f"覆盖 {len(get_provinces())} 省, 类型自动扫描")
         logger.info("=" * 50)
 
-        # 启动监控端点
+        # 监控端点
         try:
             self._monitor = MonitoringServer(port=9090)
             self._monitor.start()
-            logger.info("监控端点已启动: http://0.0.0.0:9090 (health/metrics)")
+            logger.info("监控端点: http://0.0.0.0:9090")
         except Exception as e:
             logger.warning(f"监控端点启动失败: {e}")
 
-        # 首次训练（如果没有已有模型）
+        # 1. 构建特征 (增量 or 全量)
+        try:
+            self.orch.build_features(force_rebuild=self.force_rebuild_features)
+        except Exception as e:
+            logger.warning(f"特征构建失败 (将使用已有特征): {e}")
+
+        # 2. 扫描数据 + 全量训练
         try:
             available = self.orch._scan_available()
             if available:
                 self.orch.train_all()
-                logger.info(f"首次训练完成: {len(available)} 组")
+                logger.info(f"训练完成: {len(available)} 组")
             else:
-                logger.info("无历史数据, 等待新数据...")
+                logger.warning("无可用数据, 跳过训练")
+                return
         except Exception as e:
             logger.error(f"训练失败: {e}")
+            return
 
-        # 主循环
-        if once:
-            self._single_run(ds_type, watch_dir)
-        else:
-            self._continuous_loop(ds_type, watch_dir)
+        # 3. 预测 + 验证 + 自优化
+        self._predict_and_validate()
 
-        # 关闭监控
+        # 4. 输出总结
+        self._print_summary()
+
         if self._monitor:
             self._monitor.stop()
 
-    def _single_run(self, ds_type: str, watch_dir: str):
-        """单次: 拉取最新数据 → 预测 → 验证."""
-        new_batches = self._fetch_new_data(ds_type, watch_dir)
-
-        if new_batches == 0:
-            logger.info("无新数据, 只做一次预测")
-            for province in get_provinces():
-                for target_type in get_types():
-                    try:
-                        self.orch.predict(province, target_type, 24)
-                    except Exception as e:
-                        logger.warning("预测失败 (%s/%s): %s", province, target_type, e)
-        else:
-            self._run_cycle()
-
-        self._print_summary()
-
-    def _continuous_loop(self, ds_type: str, watch_dir: str):
-        """持续: watcher 发现新数据 → 触发完整流水线."""
-        while self.running:
-            cycle_start = datetime.now()
-            logger.info("-" * 40)
-            logger.info(f"轮询新数据 @ {cycle_start.strftime('%H:%M:%S')}")
-
-            new_batches = self._fetch_new_data(ds_type, watch_dir)
-
-            if new_batches > 0:
-                logger.info(f"发现 {new_batches} 批新数据, 触发流水线...")
-                self._run_cycle()
-            else:
-                logger.info("无新数据, 跳过本轮")
-
-            elapsed = datetime.now() - cycle_start
-            sleep_time = max(0, (self.interval - elapsed).total_seconds())
-            logger.info(f"等待 {sleep_time:.0f}s 后下一轮轮询...")
-            time.sleep(sleep_time)
-
-    def _fetch_new_data(self, ds_type: str, watch_dir: str) -> int:
-        """拉取新数据. 返回导入的批次数."""
-        if ds_type == "doris":
-            return self.watcher.watch_doris(
-                callback=lambda p, t, m: self._on_new_data(p, t, m)
-            )
-        elif watch_dir:
-            return self.watcher.watch_file(
-                watch_dir,
-                callback=lambda p, t, m: self._on_new_data(p, t, m)
-            )
-        elif ds_type == "file":
-            # 默认: 监控 .energy_data/raw/ 目录
-            import os
-            default_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".energy_data", "raw")
-            if os.path.isdir(default_dir):
-                return self.watcher.watch_file(
-                    default_dir,
-                    callback=lambda p, t, m: self._on_new_data(p, t, m)
-                )
-        return 0
-
-    def _on_new_data(self, province: str, target_type: str, msg: str):
-        """新数据到达时的回调: 立即触发该 province/type 的预测+验证链."""
-        key = f"{province}_{target_type}"
-        self.rounds[key] = self.rounds.get(key, 0) + 1
-        round_num = self.rounds[key]
-
-        try:
-            # 预测
-            logger.info(f"[{key}#{round_num}] 新数据到达, 开始预测...")
-            pred_result = self.orch.predict(province, target_type, 24)
-            n_pred = pred_result.get("n_predictions", 0)
-            self.last_predict[key] = datetime.now()
-            health = pred_result.get("health", {})
-            record_prediction(province, target_type,
-                            health.get("mape", 0) or 0,
-                            n_pred,
-                            health.get("status", "ok"))
-            logger.info(f"[{key}#{round_num}] 预测完成: {n_pred} 步")
-
-            # 如果已有历史预测可对比 → 验证
-            if round_num > 1:
-                self._validate_and_improve(province, target_type, key, round_num)
-
-        except Exception as e:
-            logger.error(f"[{key}#{round_num}] 异常: {e}", exc_info=True)
-
-    def _run_cycle(self):
-        """批量: 遍历所有 province/type 跑预测+验证."""
+    def _predict_and_validate(self):
         for province in get_provinces():
-            for target_type in get_types():
-                if not self.running:
-                    break
+            for target_type in get_available_types(province):
                 key = f"{province}_{target_type}"
-                self.rounds[key] = self.rounds.get(key, 0) + 1
-                rn = self.rounds[key]
-
                 try:
-                    pred_result = self.orch.predict(province, target_type, 24)
-                    health = pred_result.get("health", {})
+                    result = self.orch.predict(province, target_type, 24)
+                    health = result.get("health", {})
                     record_prediction(province, target_type,
-                                    health.get("mape", 0) or 0,
-                                    pred_result.get("n_predictions", 0),
-                                    health.get("status", "ok"))
-                    if rn > 1:
-                        self._validate_and_improve(province, target_type, key, rn)
+                                      health.get("mape", 0) or 0,
+                                      result.get("n_predictions", 0),
+                                      health.get("status", "ok"))
+
+                    # 验证 + 退化检测 → 自动优化
+                    val = self.orch.run_validation_cycle(province, target_type)
+                    mape = None
+                    if val.get("status") == "improved":
+                        imp = val.get("improvement", {})
+                        logger.info(f"[{key}] 自动优化: "
+                                    f"策略={imp.get('selected_strategy')}, "
+                                    f"MAPE {imp.get('mape_before')}→{imp.get('mape_after')}")
+                    elif "report" in val:
+                        mape = val["report"]["metrics"].get("mape")
+                        logger.info(f"[{key}] 验证: MAPE={mape}")
+
+                    if mape is not None:
+                        self.last_mape[key] = mape
+
                 except Exception as e:
-                    logger.error(f"[{key}#{rn}] 异常: {e}")
+                    logger.error(f"[{key}] 异常: {e}")
 
-    def _validate_and_improve(self, province: str, target_type: str, key: str, rn: int):
-        """验证 + 如果退化就触发自主优化."""
-        val_result = self.orch.run_validation_cycle(province, target_type)
-
-        mape = None
-        if val_result.get("status") == "improved":
-            imp = val_result.get("improvement", {})
-            logger.info(f"[{key}#{rn}] 自动优化: "
-                        f"策略={imp.get('selected_strategy')}, "
-                        f"MAPE {imp.get('mape_before')}→{imp.get('mape_after')}")
-        elif "report" in val_result:
-            mape = val_result["report"]["metrics"].get("mape")
-            logger.info(f"[{key}#{rn}] 验证: MAPE={mape}")
-
-        if mape is not None:
-            self.last_mape[key] = mape
 
     def _print_summary(self):
         logger.info("=" * 50)
         logger.info("本轮总结")
-        for key, mape in sorted(self.last_mape.items(), key=lambda x: x[1] or 0):
+        for key, mape in sorted(self.last_mape.items(), key=lambda x: x[1] or 999):
             logger.info(f"  {key}: MAPE={mape}")
         logger.info("=" * 50)
-
-    def _handle_stop(self, signum, frame):
-        logger.info("收到停止信号, 安全退出...")
-        self.running = False
 
 
 # ============================================================
@@ -223,16 +134,15 @@ class Daemon:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="能源预测自动调度引擎")
-    parser.add_argument("--interval", type=int, default=15, help="轮询间隔(分钟)")
-    parser.add_argument("--once", action="store_true", help="单次运行后退出")
-    parser.add_argument("--source", type=str, default=None, help="数据源: file|doris|api")
-    parser.add_argument("--watch", type=str, default=None, help="监控的目录 (file 模式)")
+    parser = argparse.ArgumentParser(
+        description="能源预测调度引擎 — 单次运行, 配合 cron 使用"
+    )
+    parser.add_argument("--force-rebuild", action="store_true",
+                        help="强制全量重建特征 (代码变更后使用)")
+    parser.add_argument("--crontab", action="store_true",
+                        help="输出推荐的 crontab 配置")
     args = parser.parse_args()
 
-    if args.source:
-        import os
-        os.environ["DATA_SOURCE"] = args.source
-
-    d = Daemon(interval_minutes=args.interval)
-    d.start(once=args.once)
+    d = Daemon()
+    d.force_rebuild_features = args.force_rebuild
+    d.run()

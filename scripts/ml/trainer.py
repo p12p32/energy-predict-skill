@@ -97,7 +97,18 @@ class Trainer:
 
     def prepare_training_data(self, df: pd.DataFrame,
                                target_col: str = "value") -> Tuple[pd.DataFrame, pd.Series]:
+        """准备训练数据，自动过滤非实际值."""
         df = df.dropna(subset=[target_col]).copy()
+
+        # value_type 过滤: 只用实际值训练
+        if "value_type" in df.columns:
+            vt_col = df["value_type"]
+            actual_mask = vt_col.isna() | (vt_col == "实际")
+            if not actual_mask.all():
+                skipped = (~actual_mask).sum()
+                logger.info("训练过滤: 排除 %d 条非实际值 (预测/其他)", skipped)
+                df = df[actual_mask]
+
         feature_cols = [
             c for c in df.columns
             if c not in EXCLUDE_COLS and c != target_col
