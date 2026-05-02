@@ -168,12 +168,13 @@ class DataWatcher:
                   callback: Callable[[str, str, str], None] = None):
         """持续轮询 HTTP API, 拉取新数据."""
         import requests
+        from scripts.core.cleanup import is_shutting_down
 
         last_fetch = self._state.get("last_api_fetch")
 
-        while True:
+        while not is_shutting_down():
             try:
-                resp = requests.get(url, timeout=30)
+                resp = requests.get(url, timeout=10)
                 if resp.status_code == 200:
                     data = resp.json()
                     if isinstance(data, list):

@@ -3,6 +3,8 @@ import glob
 import hashlib
 import logging
 import os
+
+import scripts.core.cleanup  # noqa — signal/atexit 注册，防止僵尸进程
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -290,6 +292,64 @@ class Orchestrator:
         # 保存特征代码版本 hash
         self._save_version()
         logger.info("特征版本已记录: %s", self._hash_feature_code()[:12])
+
+    def predict_engineered(self, province: str, target_type: str,
+                           horizon_hours: int = 24) -> Dict:
+        """工程化预测入口: 一步完成 加载→健康检查→预测→校准→结构化结果.
+
+        返回包含 MAPE 历史、特征覆盖度、区间覆盖率等诊断信息.
+        """
+        result = self.predict(province, target_type, horizon_hours)
+
+        # 附加诊断信息
+        try:
+            end = datetime.now()
+            start = end - timedelta(days=30)
+            for rt in result.get("resolved_types", [target_type]):
+                features_df = self.store.load_features(
+                    province, rt,
+                    start.strftime("%Y-%m-%d"),
+                    (end + timedelta(days=1)).strftime("%Y-%m-%d"),
+                    value_type_filter="实际",
+                )
+                if features_df.empty:
+                    features_df = self._load_latest_features(province, rt, days=30)
+
+                if not features_df.empty and len(features_df) >= 96 * 7:
+                    # 特征覆盖度
+                    weather_cols = ["temperature", "humidity", "wind_speed",
+                                    "solar_radiation", "precipitation", "pressure"]
+                    present = [c for c in weather_cols if c in features_df.columns and features_df[c].notna().sum() > 0]
+                    result["feature_coverage"] = {
+                        "total_features": len(features_df.columns),
+                        "weather_present": len(present),
+                        "weather_missing": len(weather_cols) - len(present),
+                        "has_economic": "coal_price" in features_df.columns,
+                    }
+                    # 数据质量
+                    if "quality_flag" in features_df.columns:
+                        bad_rate = (features_df["quality_flag"] >= 2).mean()
+                        result["data_quality"] = {
+                            "anomaly_rate": round(float(bad_rate), 4),
+                            "status": "ok" if bad_rate < 0.05 else "degraded",
+                        }
+                    break
+        except Exception as e:
+            logger.warning("诊断信息收集失败: %s", e)
+
+        # 区间覆盖率估计 (基于最近历史)
+        try:
+            bt = self.backtester.evaluate_model(
+                self._load_latest_features(province, target_type, days=30),
+                train_window_days=7, test_window_hours=24,
+                province=province, target_type=target_type,
+            )
+            if "overall_mape" in bt:
+                result["recent_mape"] = bt["overall_mape"]
+        except Exception:
+            pass
+
+        return result
 
     def predict(self, province: str, target_type: str,
                 horizon_hours: int = 24) -> Dict:

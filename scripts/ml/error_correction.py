@@ -3,6 +3,10 @@
 两阶段预测:
   Stage 1: LightGBM → ŷ_lgb (捕捉非线性)
   Stage 2: AR 模型预测残差 r̂, 修正 ŷ_final = ŷ_lgb + r̂
+
+v2 改进:
+  - 自适应 AR order: 用 PACF 自动选择最优阶数
+  - 安全边界: 残差修正量不超过 P50 的配置比例
 """
 import numpy as np
 import pandas as pd
@@ -17,10 +21,47 @@ class ErrorCorrectionModel:
     预测时先用 AR 预测未来残差, 再叠加到 LightGBM 预测上.
     """
 
-    def __init__(self, order: int = 96):
-        self.order = order           # AR 阶数 (默认 24h = 96步)
+    def __init__(self, order: int = 96, auto_order: bool = True,
+                 max_order: int = 192, min_order: int = 12):
+        self.order = order
+        self.auto_order = auto_order
+        self.max_order = max_order
+        self.min_order = min_order
         self.coefficients = None     # AR 系数
         self.training_mape = None
+
+    def _select_order(self, residuals: np.ndarray) -> int:
+        """用 PACF 选择最优 AR 阶数 (AIC 准则)."""
+        n = len(residuals)
+        max_lag = min(self.max_order, n // 5)
+        if max_lag < self.min_order:
+            return max_lag
+
+        best_order = self.min_order
+        best_aic = float("inf")
+
+        for p in range(self.min_order, max_lag + 1, 12):  # 步长12
+            try:
+                acf = self._autocorr(residuals, p)
+                coef = self._levinson_durbin(acf)
+                if len(coef) == 0:
+                    continue
+
+                pred = self._predict_in_sample(residuals, coef)
+                if len(pred) < 10:
+                    continue
+
+                rss = np.sum((residuals[p:] - pred) ** 2)
+                if rss <= 0:
+                    continue
+                aic = n * np.log(rss / n) + 2 * p
+                if aic < best_aic:
+                    best_aic = aic
+                    best_order = p
+            except Exception:
+                continue
+
+        return best_order
 
     def fit(self, residuals: np.ndarray):
         """用残差序列拟合 AR 模型.
@@ -28,9 +69,12 @@ class ErrorCorrectionModel:
         r[t] = Σ a_i * r[t-i] + ε_t
         """
         n = len(residuals)
-        if n < self.order + 10:
+        if n < self.min_order + 10:
             self.coefficients = np.array([0.0])
             return
+
+        if self.auto_order:
+            self.order = self._select_order(residuals)
 
         # 构建 Yule-Walker 方程 (快速 AR 估计)
         acf = self._autocorr(residuals, self.order)
@@ -137,14 +181,21 @@ class ErrorCorrectionModel:
 
         return -a
 
-    def _predict_in_sample(self, residuals: np.ndarray) -> np.ndarray:
+    def _predict_in_sample(self, residuals: np.ndarray,
+                           coef: np.ndarray = None) -> np.ndarray:
         """训练集上的一步预测."""
+        if coef is None:
+            coef = self.coefficients
+        if coef is None or len(coef) == 0:
+            return np.array([])
         n = len(residuals)
-        order = len(self.coefficients)
+        order = len(coef)
+        if n <= order:
+            return np.array([])
         pred = np.zeros(n - order)
 
         for t in range(order, n):
             window = residuals[t - order:t]
-            pred[t - order] = np.dot(self.coefficients[::-1], window)
+            pred[t - order] = np.dot(coef[::-1], window)
 
         return pred

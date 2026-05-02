@@ -17,7 +17,7 @@ import numpy as np
 import lightgbm as lgb
 from sklearn.model_selection import TimeSeriesSplit
 
-from scripts.core.config import get_model_config
+from scripts.core.config import get_model_config, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -182,11 +182,16 @@ class Trainer:
                     target_type: str, target_col: str = "value",
                     params: Dict = None) -> Dict:
         X, y = self.prepare_training_data(df, target_col)
+        cfg = load_config()
+        tc = cfg.get("trainer", {})
         lgb_params = {
-            "objective": "regression", "metric": "rmse",
-            "num_leaves": 31, "learning_rate": 0.05,
-            "verbose": -1, "n_estimators": 300,
-            "min_child_samples": 20,
+            "objective": "quantile", "alpha": 0.5, "metric": "quantile",
+            "num_leaves": tc.get("quick_num_leaves", 63),
+            "learning_rate": tc.get("quick_learning_rate", 0.03),
+            "verbose": -1,
+            "n_estimators": tc.get("quick_n_estimators", 500),
+            "min_child_samples": 20, "subsample": 0.8,
+            "colsample_bytree": 0.8, "reg_alpha": 0.1, "reg_lambda": 1.0,
         }
         if params:
             lgb_params.update(params)

@@ -1,11 +1,13 @@
 """data_fetcher.py — 外部数据采集（气象、煤价、碳价）"""
 import time
+import atexit
 from typing import Optional, Dict
 from datetime import datetime, timedelta
 
 import requests
 import pandas as pd
 from scripts.core.config import get_province_coords
+from scripts.core.cleanup import is_shutting_down
 
 OPEN_METEO_HISTORICAL = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
@@ -29,10 +31,26 @@ WEATHER_COLUMN_MAP = {
 
 class WeatherFetcher:
     def __init__(self, source: str = "open-meteo",
-                 max_retries: int = 3, retry_delay: float = 2.0):
+                 max_retries: int = 1, retry_delay: float = 2.0):
         self.source = source
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.request_timeout = 5  # 防止阻塞事件循环
+        self._session = None
+        atexit.register(self.close)
+
+    def _get_session(self) -> requests.Session:
+        if self._session is None:
+            self._session = requests.Session()
+        return self._session
+
+    def close(self):
+        if self._session:
+            try:
+                self._session.close()
+            except Exception:
+                pass
+            self._session = None
 
     def fetch_historical(self, province: str, lat: float, lon: float,
                          start_date: str, end_date: str) -> pd.DataFrame:
@@ -62,15 +80,23 @@ class WeatherFetcher:
         return self._parse_response(data, province, is_forecast=True)
 
     def _request(self, url: str, params: Dict) -> Dict:
+        session = self._get_session()
         for attempt in range(self.max_retries):
-            resp = requests.get(url, params=params, timeout=30)
-            if resp.status_code == 200:
-                return resp.json()
+            if is_shutting_down():
+                raise RuntimeError("进程正在关闭，取消网络请求")
+            try:
+                resp = session.get(url, params=params, timeout=self.request_timeout)
+                if resp.status_code == 200:
+                    return resp.json()
+            except requests.exceptions.Timeout:
+                if attempt >= self.max_retries - 1:
+                    raise RuntimeError(f"气象 API 超时 ({self.request_timeout}s): {url}")
+            except requests.exceptions.ConnectionError:
+                if attempt >= self.max_retries - 1:
+                    raise RuntimeError(f"气象 API 连接失败: {url}")
             if attempt < self.max_retries - 1:
                 time.sleep(self.retry_delay * (attempt + 1))
-        raise RuntimeError(
-            f"气象 API 请求失败，status={resp.status_code} url={url}"
-        )
+        raise RuntimeError(f"气象 API 请求失败: {url}")
 
     def _parse_response(self, data: Dict, province: str,
                         is_forecast: bool) -> pd.DataFrame:

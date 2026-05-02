@@ -27,6 +27,22 @@ model:
   default_window_days: 90
   forecast_horizon_hours: 96
 
+# 预测器参数 (Predictor v2)
+predictor:
+  lookback_days: 30               # 训练数据回溯天数 (最少14天自动降级)
+  lgb_weight_min: 0.45            # LGB 最小权重 (趋势集成时)
+  lgb_weight_decay: 0.002         # LGB 权重每步衰减率
+  ecm_clip_ratio: 0.30            # ECM 残差修正上限 (相对P50比例)
+
+# 训练器参数 (Trainer v2)
+trainer:
+  quick_n_estimators: 500         # quick_train 迭代次数
+  quick_num_leaves: 63            # quick_train 叶子数
+  quick_learning_rate: 0.03       # quick_train 学习率
+  quantile_n_estimators: 500      # quantile_train 迭代次数
+  quantile_num_leaves: 31         # quantile_train 叶子数
+  quantile_learning_rate: 0.03    # quantile_train 学习率
+
 validator:
   short_term_mape_threshold: 0.05
   mid_term_mape_threshold: 0.10
