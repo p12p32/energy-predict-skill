@@ -154,6 +154,9 @@ class Predictor:
         # 自适应区间校准
         ensemble = self._calibrate_intervals(ensemble, history, province, target_type)
 
+        # 波动率校准: 预测过度平滑时恢复历史波动幅度
+        ensemble = self._calibrate_volatility(ensemble, history, target_type)
+
         # 光伏夜间归零 — 树模型无法硬归零，后处理修复
         if "光伏" in target_type and "dt" in ensemble.columns:
             dts = pd.to_datetime(ensemble["dt"])
@@ -1033,5 +1036,58 @@ class Predictor:
                 ensemble["p90"] = raw_p90 if allow_neg else np.maximum(raw_p90, 0)
         except Exception as e:
             logger.warning("区间校准失败 (%s/%s): %s", province, target_type, e)
+
+        return ensemble
+
+    def _calibrate_volatility(self, ensemble: pd.DataFrame,
+                               history: pd.DataFrame,
+                               target_type: str) -> pd.DataFrame:
+        """波动率校准: 预测过度平滑时恢复历史波动幅度.
+
+        仅对波动型(风电/联络线/非市场)生效.
+        保持均值不变, 将偏离均值的幅度缩放到历史CV的70%.
+        """
+        VOLATILE_TYPES = ["风电", "联络线", "非市场"]
+        if not any(kw in target_type for kw in VOLATILE_TYPES):
+            return ensemble
+        if "value" not in history.columns or len(history) < 96 * 3:
+            return ensemble
+
+        values = history["value"].dropna().values
+        if len(values) < 96 * 3:
+            return ensemble
+
+        p50 = ensemble["p50"].values
+        pred_mean = np.mean(p50)
+        pred_std = np.std(p50)
+
+        if pred_std < 1e-6:
+            return ensemble
+
+        # 历史7日CV (日内去均值后用残差波动率)
+        days = min(len(values) // 96, 7)
+        reshaped = values[-days * 96:].reshape(days, 96)
+        daily_means = np.mean(reshaped, axis=1, keepdims=True)
+        residuals = reshaped - daily_means
+        hist_cv = float(np.std(residuals) / (np.mean(np.abs(daily_means)) + 1e-6))
+
+        pred_cv = pred_std / (abs(pred_mean) + 1e-6)
+
+        # 预测CV低于历史CV的70%时才校准
+        target_cv = hist_cv * 0.7
+        if pred_cv >= target_cv:
+            return ensemble
+
+        scale = target_cv / pred_cv
+        scale = min(scale, 3.0)  # 最多放大3倍
+
+        calibrated_p50 = pred_mean + (p50 - pred_mean) * scale
+        shift = calibrated_p50 - p50
+
+        ensemble["p50"] = calibrated_p50
+        if "p10" in ensemble.columns:
+            ensemble["p10"] = ensemble["p10"].values + shift
+        if "p90" in ensemble.columns:
+            ensemble["p90"] = ensemble["p90"].values + shift
 
         return ensemble
