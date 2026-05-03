@@ -515,23 +515,10 @@ class Predictor:
             np.abs(future_df["value_zscore_24h"]) * future_df["extreme_weather_flag"]
         )
 
-        # ── 补齐高级滚动统计 (与 prepare_training_data 对齐) ──
-        # 用历史日内模式而非常量: 训练时这些特征随日内时刻变化, 预测时也应有日内差异
+        # ── 补齐高级滚动统计 (与 features.py training 对齐: rolling window 标量) ──
         hist_vals = history["value"].values
         n_hist = len(hist_vals)
-        if n_hist >= 672:  # 至少7天数据才可靠
-            days = min(n_hist // 96, 30)  # 最多取30天
-            reshaped = hist_vals[-days * 96:].reshape(days, 96)
-            hourly_std_pat = np.nanstd(reshaped, axis=0)
-            hourly_min_pat = np.nanmin(reshaped, axis=0)
-            hourly_max_pat = np.nanmax(reshaped, axis=0)
-            for i in range(len(future_df)):
-                slot = i % 96
-                future_df.loc[future_df.index[i], "value_rolling_std_24h"] = float(hourly_std_pat[slot])
-                future_df.loc[future_df.index[i], "value_rolling_max_24h"] = float(hourly_max_pat[slot])
-                future_df.loc[future_df.index[i], "value_rolling_min_24h"] = float(hourly_min_pat[slot])
-                future_df.loc[future_df.index[i], "value_range_24h"] = float(hourly_max_pat[slot] - hourly_min_pat[slot])
-        elif n_hist >= 96:
+        if n_hist >= 96:
             recent_96_vals = hist_vals[-96:]
             future_df["value_rolling_std_24h"] = float(np.std(recent_96_vals))
             future_df["value_rolling_max_24h"] = float(np.max(recent_96_vals))
