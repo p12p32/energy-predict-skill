@@ -129,7 +129,7 @@ class Predictor:
                 horizon_steps
             )
 
-        trend_pred = self._predict_trend(history, horizon_steps)
+        trend_pred = self._predict_trend(history, horizon_steps, target_type)
         ensemble = self._ensemble(predictions, trend_pred, history, target_type,
                                   xgb_p50=xgb_p50)
 
@@ -214,12 +214,20 @@ class Predictor:
         return result
 
     def _predict_trend(self, history: pd.DataFrame,
-                       horizon_steps: int) -> np.ndarray:
+                       horizon_steps: int, target_type: str = "") -> np.ndarray:
         if "value" not in history.columns or len(history) < 96:
             return np.zeros(horizon_steps)
         values = history["value"].dropna().values
         if len(values) == 0:
             return np.zeros(horizon_steps)
+
+        # 波动型: Holt线性外推不可靠, 用昨日同时刻值作为趋势基线
+        VOLATILE_TREND_TYPES = ["风电", "联络线", "非市场"]
+        if any(kw in target_type for kw in VOLATILE_TREND_TYPES) and len(values) >= 96:
+            yesterday = values[-96:]
+            repeats = horizon_steps // 96 + 1
+            return np.tile(yesterday, repeats)[:horizon_steps]
+
         trend_model = TrendModel()
         trend_model.fit(values)
         return trend_model.predict_with_daily_pattern(horizon_steps, values)
