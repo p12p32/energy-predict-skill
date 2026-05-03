@@ -239,7 +239,8 @@ class Predictor:
                   xgb_p50: np.ndarray = None) -> pd.DataFrame:
         """集成预测: LGB + (XGB) + Trend 加权平均.
 
-        波动型(风电/联络线/光伏): 趋势模型不稳定, LGB 保持高权重.
+        趋势有害型(风电/联络线/非市场): 纯 LGBM, 趋势模型方向不可靠.
+        趋势中性型(光伏): LGB 高权重 + 趋势微调.
         稳定型(总/负荷/地方/自备): 趋势模型可靠, 允许更多趋势权重.
         """
         n = len(lgb_result)
@@ -247,34 +248,45 @@ class Predictor:
         lgb_p50 = lgb_result["p50"].values
         allow_neg = self._allow_negative(target_type)
 
-        # 波动型: LGB 高权重, 趋势模型仅做微调
-        VOLATILE_TYPES = ["风电", "联络线", "光伏", "非市场"]
-        is_volatile = any(kw in target_type for kw in VOLATILE_TYPES)
+        TREND_HARMFUL = ["风电", "联络线", "非市场"]
+        TREND_NEUTRAL = ["光伏"]
+        is_harmful = any(kw in target_type for kw in TREND_HARMFUL)
+        is_neutral = any(kw in target_type for kw in TREND_NEUTRAL)
+        is_volatile = is_harmful or is_neutral
 
-        if is_volatile:
+        if is_harmful:
+            # 纯 LGBM — 趋势模型对波动型数据方向不可靠
+            lgb_w = np.ones(n)
+            ensemble_p50 = lgb_p50.astype(float)
+        elif is_neutral:
             lgb_start, lgb_min = 0.90, 0.75
-        else:
-            lgb_start, lgb_min = 0.85, self._lgb_weight_min
-
-        if xgb_p50 is not None and len(xgb_p50) >= n:
-            xgb_p50 = xgb_p50[:n]
-            if not allow_neg:
-                xgb_p50 = np.maximum(xgb_p50, 0)
-            # 3-way: LGB + XGB + Trend
-            if is_volatile:
+            if xgb_p50 is not None and len(xgb_p50) >= n:
+                xgb_p50 = xgb_p50[:n]
+                if not allow_neg:
+                    xgb_p50 = np.maximum(xgb_p50, 0)
                 lgb_w = np.array([max(lgb_min, lgb_start - self._lgb_weight_decay * i) for i in range(n)])
                 xgb_w = np.full(n, 0.08)
+                trend_w = 1.0 - lgb_w - xgb_w
+                ensemble_p50 = lgb_w * lgb_p50 + xgb_w * xgb_p50 + trend_w * trend_preds
             else:
+                lgb_w = np.array([max(lgb_min, lgb_start - self._lgb_weight_decay * i) for i in range(n)])
+                trend_w = 1.0 - lgb_w
+                ensemble_p50 = lgb_w * lgb_p50 + trend_w * trend_preds
+        else:
+            lgb_start, lgb_min = 0.85, self._lgb_weight_min
+            if xgb_p50 is not None and len(xgb_p50) >= n:
+                xgb_p50 = xgb_p50[:n]
+                if not allow_neg:
+                    xgb_p50 = np.maximum(xgb_p50, 0)
                 lgb_w = np.array([max(lgb_min, 0.50 - self._lgb_weight_decay * i) for i in range(n)])
                 xgb_w = np.full(n, 0.25)
-            trend_w = 1.0 - lgb_w - xgb_w
-            ensemble_p50 = lgb_w * lgb_p50 + xgb_w * xgb_p50 + trend_w * trend_preds
-        else:
-            # 2-way: LGB + Trend (回退)
-            lgb_w = np.array([max(lgb_min,
-                                  lgb_start - self._lgb_weight_decay * i) for i in range(n)])
-            trend_w = 1.0 - lgb_w
-            ensemble_p50 = lgb_w * lgb_p50 + trend_w * trend_preds
+                trend_w = 1.0 - lgb_w - xgb_w
+                ensemble_p50 = lgb_w * lgb_p50 + xgb_w * xgb_p50 + trend_w * trend_preds
+            else:
+                lgb_w = np.array([max(lgb_min,
+                                      lgb_start - self._lgb_weight_decay * i) for i in range(n)])
+                trend_w = 1.0 - lgb_w
+                ensemble_p50 = lgb_w * lgb_p50 + trend_w * trend_preds
 
         result = lgb_result.copy()
         result["p50"] = ensemble_p50 if allow_neg else np.maximum(ensemble_p50, 0)
