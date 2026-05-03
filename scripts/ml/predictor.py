@@ -271,6 +271,29 @@ class Predictor:
         last_row = history.iloc[-1].copy()
         last_value = last_row.get("value", 0)
         last_price = last_row.get("price", 0)
+        hist_vals = history["value"].values
+        n_hist = len(hist_vals)
+
+        # 构建 datetime → index 查找表, 解决预测日期与数据截止日之间有缺口时 lag 位置错位
+        hist_dt_index = pd.Series(np.arange(n_hist), index=history["dt"].values)
+
+        def _find_pos(target_dt, offset_hours):
+            """在 history 中查找 target_dt - offset_hours 时刻的 index 位置.
+            找不到精确匹配时取最近的同时刻 (允许 ±30min), 都没有返回 None."""
+            lag_dt = target_dt - timedelta(hours=offset_hours)
+            if lag_dt in hist_dt_index.index:
+                return hist_dt_index[lag_dt]
+            for delta_m in [0, 15, -15, 30, -30, 45, -45, 60, -60]:
+                candidate = lag_dt + timedelta(minutes=delta_m)
+                if candidate in hist_dt_index.index:
+                    return hist_dt_index[candidate]
+            return None
+
+        def _lookup_lag(target_dt, offset_hours):
+            """在 history 中查找 target_dt - offset_hours 时刻的 value."""
+            pos = _find_pos(target_dt, offset_hours)
+            return float(hist_vals[pos]) if pos is not None else last_value
+
         ti = parse_type(target_type)
         future_times = pd.date_range(
             start=base_dt + timedelta(minutes=15),
@@ -291,47 +314,25 @@ class Predictor:
                            else 2 if ft.month in [6, 7, 8]
                            else 3 if ft.month in [9, 10, 11] else 4),
             }
-            lag_1d_step, lag_7d_step = 96, 672
-            hist_vals = history["value"].values
-            n_hist = len(hist_vals)
 
-            # value_lag_1d: 96 步前 (24h)
-            pos_1d = n_hist - lag_1d_step + i
-            if pos_1d >= 0 and pos_1d < n_hist:
-                row["value_lag_1d"] = float(hist_vals[pos_1d])
-            else:
-                # 回退: 用 value_lag_7d 替代 (上周同时刻)
-                pos_7d = n_hist - lag_7d_step + i
-                if pos_7d >= 0 and pos_7d < n_hist:
-                    row["value_lag_1d"] = float(hist_vals[pos_7d])
-                else:
-                    row["value_lag_1d"] = last_value
+            # value_lag_1d / value_lag_7d: 基于 datetime 查找, 消除缺口偏移
+            lag1 = _lookup_lag(ft, 24)
+            lag7 = _lookup_lag(ft, 168)
+            row["value_lag_1d"] = lag1
+            row["value_lag_7d"] = lag7
 
-            # value_lag_7d: 672 步前 (7天)
-            pos_7d = n_hist - lag_7d_step + i
-            if pos_7d >= 0 and pos_7d < n_hist:
-                row["value_lag_7d"] = float(hist_vals[pos_7d])
-            else:
-                row["value_lag_7d"] = last_value
-
-            # rolling mean: 最近 96 步均值 (始终从 history 尾部取)
+            # rolling mean: 最近 96 步均值 (history 尾部)
             recent_96 = hist_vals[-96:] if n_hist >= 96 else hist_vals
             row["value_rolling_mean_24h"] = float(np.mean(recent_96))
 
-            # diff 特征: 用已知 lag 计算
-            lag1_val = row.get("value_lag_1d", last_value)
-            lag7_val = row.get("value_lag_7d", last_value)
-            row["value_diff_1d"] = float(last_value - lag1_val) if last_value and lag1_val else 0.0
-            row["value_diff_7d"] = float(last_value - lag7_val) if last_value and lag7_val else 0.0
+            # diff 特征
+            row["value_diff_1d"] = float(last_value - lag1) if last_value and lag1 else 0.0
+            row["value_diff_7d"] = float(last_value - lag7) if last_value and lag7 else 0.0
 
-            # 方向特征 (抽水蓄能等双向运行类型)
+            # 方向特征
             row["value_sign"] = float(np.sign(last_value)) if n_hist > 0 else 0.0
-            # value_sign_lag_1d: 从历史查找对应96步前的符号
-            sign1d_pos = n_hist - 96 + i
-            if sign1d_pos >= 0 and sign1d_pos < n_hist:
-                row["value_sign_lag_1d"] = float(np.sign(hist_vals[sign1d_pos]))
-            else:
-                row["value_sign_lag_1d"] = row["value_sign"]
+            sign_lag1 = np.sign(lag1) if lag1 else 0.0
+            row["value_sign_lag_1d"] = float(sign_lag1)
             row["value_sign_change"] = 1.0 if abs(row["value_sign"] - row["value_sign_lag_1d"]) > 0.5 else 0.0
 
             rows.append(row)
@@ -528,42 +529,44 @@ class Predictor:
         future_df["solar_potential"] = solar.values / 1000.0
         future_df["solar_efficiency"] = np.clip(1.0 - 0.005 * (temp.values - 25), 0.5, 1.0)
 
-        # 天气 lag/diff (用 history 尾部同时刻填充)
+        # 天气 lag/diff (基于 datetime 查找, 消除缺口偏移)
         if "solar_radiation" in history.columns:
             hist_solar = history["solar_radiation"].values
             for i in range(len(future_df)):
-                pos_1d = n_hist - 96 + i
+                ft = future_df.loc[future_df.index[i], "dt"]
+                pos_1d = _find_pos(ft, 24)
                 future_df.loc[future_df.index[i], "solar_radiation_lag_1d"] = (
-                    float(hist_solar[pos_1d]) if 0 <= pos_1d < n_hist else float(solar.iloc[i]))
+                    float(hist_solar[pos_1d]) if pos_1d is not None else float(solar.iloc[i]))
                 future_df.loc[future_df.index[i], "solar_radiation_diff_1d"] = (
                     float(solar.iloc[i]) - future_df.loc[future_df.index[i], "solar_radiation_lag_1d"])
 
         if "wind_speed" in history.columns:
             hist_wind = history["wind_speed"].values
             for i in range(len(future_df)):
-                pos_1d = n_hist - 96 + i
+                ft = future_df.loc[future_df.index[i], "dt"]
+                pos_1d = _find_pos(ft, 24)
                 future_df.loc[future_df.index[i], "wind_speed_lag_1d"] = (
-                    float(hist_wind[pos_1d]) if 0 <= pos_1d < n_hist else float(wind.iloc[i]))
+                    float(hist_wind[pos_1d]) if pos_1d is not None else float(wind.iloc[i]))
                 future_df.loc[future_df.index[i], "wind_speed_diff_1d"] = (
                     float(wind.iloc[i]) - future_df.loc[future_df.index[i], "wind_speed_lag_1d"])
 
         if "temperature" in history.columns:
             hist_temp = history["temperature"].values
-            n_temp = len(hist_temp)
             for i in range(len(future_df)):
-                pos_1d = n_temp - 96 + i
-                pos_1h = n_temp - 4 + i
-                pos_6h = n_temp - 24 + i
+                ft = future_df.loc[future_df.index[i], "dt"]
+                pos_1d = _find_pos(ft, 24)
+                pos_1h = _find_pos(ft, 1)
+                pos_6h = _find_pos(ft, 6)
                 future_df.loc[future_df.index[i], "temperature_lag_1d"] = (
-                    float(hist_temp[pos_1d]) if 0 <= pos_1d < n_temp else float(temp.iloc[i]))
+                    float(hist_temp[pos_1d]) if pos_1d is not None else float(temp.iloc[i]))
                 future_df.loc[future_df.index[i], "temperature_diff_1d"] = (
                     float(temp.iloc[i]) - future_df.loc[future_df.index[i], "temperature_lag_1d"])
                 future_df.loc[future_df.index[i], "temp_change_1h"] = (
                     float(temp.iloc[i]) - float(hist_temp[pos_1h])
-                    if 0 <= pos_1h < n_temp else 0.0)
+                    if pos_1h is not None else 0.0)
                 future_df.loc[future_df.index[i], "temp_change_6h"] = (
                     float(temp.iloc[i]) - float(hist_temp[pos_6h])
-                    if 0 <= pos_6h < n_temp else 0.0)
+                    if pos_6h is not None else 0.0)
 
         # 连续高温天数 (简单近似: 最近 history 中的连续高温)
         if "temperature" in history.columns:
@@ -598,26 +601,33 @@ class Predictor:
                 )
                 if ct_data is not None and not ct_data.empty and "value" in ct_data.columns:
                     ct_vals = ct_data["value"].values
-                    n_ct = len(ct_vals)
+                    ct_dt_index = pd.Series(np.arange(len(ct_vals)), index=ct_data["dt"].values)
+                    ct_mean_96 = float(np.mean(ct_vals[-96:]) if len(ct_vals) >= 96 else np.mean(ct_vals))
                     for i in range(len(future_df)):
-                        # value: 最近96步的对应时刻值
-                        pos = n_ct - 96 + i
-                        if 0 <= pos < n_ct:
-                            future_df.loc[future_df.index[i], f"{ct}_value"] = float(ct_vals[pos])
-                        else:
-                            future_df.loc[future_df.index[i], f"{ct}_value"] = float(np.mean(ct_vals[-96:]) if n_ct >= 96 else np.mean(ct_vals))
-                        # lag_1d: 96步前
-                        lag1_pos = n_ct - 192 + i
-                        if 0 <= lag1_pos < n_ct:
-                            future_df.loc[future_df.index[i], f"{ct}_lag_1d"] = float(ct_vals[lag1_pos])
-                        else:
-                            future_df.loc[future_df.index[i], f"{ct}_lag_1d"] = float(np.mean(ct_vals[-96:]) if n_ct >= 96 else np.mean(ct_vals))
-                        # lag_7d: 672步前
-                        lag7_pos = n_ct - 768 + i
-                        if 0 <= lag7_pos < n_ct:
-                            future_df.loc[future_df.index[i], f"{ct}_lag_7d"] = float(ct_vals[lag7_pos])
-                        else:
-                            future_df.loc[future_df.index[i], f"{ct}_lag_7d"] = float(np.mean(ct_vals[-96:]) if n_ct >= 96 else np.mean(ct_vals))
+                        ft = future_df.loc[future_df.index[i], "dt"]
+
+                        def _ct_pos(offset_hours):
+                            """在交叉类型数据中查找 target_dt - offset_hours 的位置."""
+                            lag_dt = ft - timedelta(hours=offset_hours)
+                            if lag_dt in ct_dt_index.index:
+                                return ct_dt_index[lag_dt]
+                            for dm in [0, 15, -15, 30, -30, 45, -45, 60, -60]:
+                                c = lag_dt + timedelta(minutes=dm)
+                                if c in ct_dt_index.index:
+                                    return ct_dt_index[c]
+                            return None
+
+                        v_pos = _ct_pos(0)
+                        future_df.loc[future_df.index[i], f"{ct}_value"] = (
+                            float(ct_vals[v_pos]) if v_pos is not None else ct_mean_96)
+
+                        l1_pos = _ct_pos(24)
+                        future_df.loc[future_df.index[i], f"{ct}_lag_1d"] = (
+                            float(ct_vals[l1_pos]) if l1_pos is not None else ct_mean_96)
+
+                        l7_pos = _ct_pos(168)
+                        future_df.loc[future_df.index[i], f"{ct}_lag_7d"] = (
+                            float(ct_vals[l7_pos]) if l7_pos is not None else ct_mean_96)
             except Exception:
                 # 如果某类型数据不可用，填0
                 for suffix in ["_value", "_lag_1d", "_lag_7d"]:
