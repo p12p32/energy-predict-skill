@@ -93,9 +93,7 @@ class ErrorCorrectionModel:
     def predict(self, recent_residuals: np.ndarray, steps: int) -> np.ndarray:
         """预测未来 steps 步的残差值.
 
-        Args:
-            recent_residuals: 最近的残差序列 (至少 order 长度)
-            steps: 预测步数
+        修正: 不再追加预测值到 history (防止累积发散), 并加指数衰减.
         """
         if self.coefficients is None or len(self.coefficients) == 0:
             return np.zeros(steps)
@@ -106,10 +104,13 @@ class ErrorCorrectionModel:
         history = list(recent_residuals[-order:])
         predictions = []
 
-        for _ in range(steps):
-            pred_val = sum(c * history[-i - 1] for i, c in enumerate(coeffs[:len(history)]))
-            predictions.append(pred_val)
-            history.append(pred_val)
+        for i in range(steps):
+            available = min(len(history), order)
+            pred_val = sum(c * history[-j - 1] for j, c in enumerate(coeffs[:available]))
+            # 指数衰减: 12小时后修正幅度减半, 防止远期发散
+            decay = np.exp(-i / 48.0)
+            predictions.append(pred_val * decay)
+            # 不移除历史残差最远项, 也不追加预测值 — 保持真实残差窗口
 
         return np.array(predictions)
 

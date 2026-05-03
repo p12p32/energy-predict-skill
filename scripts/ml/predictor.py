@@ -156,8 +156,10 @@ class Predictor:
 
         # 光伏夜间归零 — 树模型无法硬归零，后处理修复
         if "光伏" in target_type and "dt" in ensemble.columns:
-            hours = pd.to_datetime(ensemble["dt"]).dt.hour
-            night_mask = (hours < 6) | (hours >= 20)
+            dts = pd.to_datetime(ensemble["dt"])
+            hours = dts.dt.hour
+            mins = dts.dt.minute
+            night_mask = (hours >= 20) | (hours < 6) | ((hours == 6) & (mins < 15))
             for col in ["p10", "p50", "p90"]:
                 if col in ensemble.columns:
                     ensemble.loc[night_mask, col] = 0.0
@@ -229,27 +231,40 @@ class Predictor:
                   xgb_p50: np.ndarray = None) -> pd.DataFrame:
         """集成预测: LGB + (XGB) + Trend 加权平均.
 
-        有 XGBoost 时: LGB 0.45 + XGB 0.25 + Trend 0.30 (初始, 按时序衰减)
-        无 XGBoost 时: LGB 0.85 + Trend 0.15 → LGB 0.45 + Trend 0.55 (96步后)
+        波动型(风电/联络线/光伏): 趋势模型不稳定, LGB 保持高权重.
+        稳定型(总/负荷/地方/自备): 趋势模型可靠, 允许更多趋势权重.
         """
         n = len(lgb_result)
         trend_preds = trend_preds[:n]
         lgb_p50 = lgb_result["p50"].values
         allow_neg = self._allow_negative(target_type)
 
+        # 波动型: LGB 高权重, 趋势模型仅做微调
+        VOLATILE_TYPES = ["风电", "联络线", "光伏", "非市场"]
+        is_volatile = any(kw in target_type for kw in VOLATILE_TYPES)
+
+        if is_volatile:
+            lgb_start, lgb_min = 0.90, 0.75
+        else:
+            lgb_start, lgb_min = 0.85, self._lgb_weight_min
+
         if xgb_p50 is not None and len(xgb_p50) >= n:
             xgb_p50 = xgb_p50[:n]
             if not allow_neg:
                 xgb_p50 = np.maximum(xgb_p50, 0)
             # 3-way: LGB + XGB + Trend
-            lgb_w = np.array([max(self._lgb_weight_min, 0.50 - self._lgb_weight_decay * i) for i in range(n)])
-            xgb_w = np.full(n, 0.25)
+            if is_volatile:
+                lgb_w = np.array([max(lgb_min, lgb_start - self._lgb_weight_decay * i) for i in range(n)])
+                xgb_w = np.full(n, 0.08)
+            else:
+                lgb_w = np.array([max(lgb_min, 0.50 - self._lgb_weight_decay * i) for i in range(n)])
+                xgb_w = np.full(n, 0.25)
             trend_w = 1.0 - lgb_w - xgb_w
             ensemble_p50 = lgb_w * lgb_p50 + xgb_w * xgb_p50 + trend_w * trend_preds
         else:
             # 2-way: LGB + Trend (回退)
-            lgb_w = np.array([max(self._lgb_weight_min,
-                                  0.85 - self._lgb_weight_decay * i) for i in range(n)])
+            lgb_w = np.array([max(lgb_min,
+                                  lgb_start - self._lgb_weight_decay * i) for i in range(n)])
             trend_w = 1.0 - lgb_w
             ensemble_p50 = lgb_w * lgb_p50 + trend_w * trend_preds
 
@@ -501,9 +516,22 @@ class Predictor:
         )
 
         # ── 补齐高级滚动统计 (与 prepare_training_data 对齐) ──
+        # 用历史日内模式而非常量: 训练时这些特征随日内时刻变化, 预测时也应有日内差异
         hist_vals = history["value"].values
         n_hist = len(hist_vals)
-        if n_hist >= 96:
+        if n_hist >= 672:  # 至少7天数据才可靠
+            days = min(n_hist // 96, 30)  # 最多取30天
+            reshaped = hist_vals[-days * 96:].reshape(days, 96)
+            hourly_std_pat = np.nanstd(reshaped, axis=0)
+            hourly_min_pat = np.nanmin(reshaped, axis=0)
+            hourly_max_pat = np.nanmax(reshaped, axis=0)
+            for i in range(len(future_df)):
+                slot = i % 96
+                future_df.loc[future_df.index[i], "value_rolling_std_24h"] = float(hourly_std_pat[slot])
+                future_df.loc[future_df.index[i], "value_rolling_max_24h"] = float(hourly_max_pat[slot])
+                future_df.loc[future_df.index[i], "value_rolling_min_24h"] = float(hourly_min_pat[slot])
+                future_df.loc[future_df.index[i], "value_range_24h"] = float(hourly_max_pat[slot] - hourly_min_pat[slot])
+        elif n_hist >= 96:
             recent_96_vals = hist_vals[-96:]
             future_df["value_rolling_std_24h"] = float(np.std(recent_96_vals))
             future_df["value_rolling_max_24h"] = float(np.max(recent_96_vals))
