@@ -31,11 +31,11 @@ WEATHER_COLUMN_MAP = {
 
 class WeatherFetcher:
     def __init__(self, source: str = "open-meteo",
-                 max_retries: int = 1, retry_delay: float = 2.0):
+                 max_retries: int = 2, retry_delay: float = 2.0):
         self.source = source
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self.request_timeout = 5  # 防止阻塞事件循环
+        self.request_timeout = 15  # 历史API较慢
         self._session = None
         atexit.register(self.close)
 

@@ -118,7 +118,7 @@ class Predictor:
                 if fn not in future_features.columns:
                     future_features[fn] = 0.0
             xgb_p50 = xgb_model.predict(future_features[feature_names].values)
-        except (FileNotFoundError, KeyError):
+        except (FileNotFoundError, KeyError, ValueError):
             pass
 
         # ── 迭代 lag 回填 ──
@@ -191,9 +191,10 @@ class Predictor:
 
         if feature_names is None:
             feature_names = p50_feature_names or []
-        for fn in feature_names:
-            if fn not in features_df.columns:
-                features_df[fn] = 0.0
+        missing = [fn for fn in feature_names if fn not in features_df.columns]
+        if missing:
+            missing_df = pd.DataFrame(0.0, index=features_df.index, columns=missing)
+            features_df = pd.concat([features_df, missing_df], axis=1)
         X = features_df[feature_names].values
 
         raw_p10 = p10_model.predict(X) if p10_model else np.zeros(len(X))
@@ -386,9 +387,23 @@ class Predictor:
                     future_df[col] = 0.0
 
         try:
+            from datetime import datetime as _dt, timezone as _tz
+            now = _dt.now(_tz.utc).replace(tzinfo=None)
+            weather_start = base_dt.strftime("%Y-%m-%d")
             forecast_end = (base_dt + timedelta(days=8)).strftime("%Y-%m-%d")
-            weather = self.fetcher.fetch_weather(
-                province, base_dt.strftime("%Y-%m-%d"), forecast_end, mode="forecast")
+            if base_dt < now - timedelta(days=1):
+                # 历史模式：end_date 不能超过昨天（历史 API 有延迟）
+                hist_end = min(base_dt + timedelta(days=8), now - timedelta(days=1))
+                forecast_end = hist_end.strftime("%Y-%m-%d")
+                weather = self.fetcher.fetch_weather(
+                    province, weather_start, forecast_end, mode="historical")
+            else:
+                try:
+                    weather = self.fetcher.fetch_weather(
+                        province, weather_start, forecast_end, mode="forecast")
+                except Exception:
+                    weather = self.fetcher.fetch_weather(
+                        province, weather_start, forecast_end, mode="historical")
             if not weather.empty:
                 weather["dt_merge"] = weather["dt"].dt.floor("15min")
                 future_df["dt_merge"] = future_df["dt"].dt.floor("15min")
@@ -484,6 +499,231 @@ class Predictor:
             np.abs(future_df["value_zscore_24h"]) * future_df["extreme_weather_flag"]
         )
 
+        # ── 补齐高级滚动统计 (与 prepare_training_data 对齐) ──
+        hist_vals = history["value"].values
+        n_hist = len(hist_vals)
+        if n_hist >= 96:
+            recent_96_vals = hist_vals[-96:]
+            future_df["value_rolling_std_24h"] = float(np.std(recent_96_vals))
+            future_df["value_rolling_max_24h"] = float(np.max(recent_96_vals))
+            future_df["value_rolling_min_24h"] = float(np.min(recent_96_vals))
+            future_df["value_range_24h"] = float(np.max(recent_96_vals) - np.min(recent_96_vals))
+        else:
+            future_df["value_rolling_std_24h"] = float(np.std(hist_vals))
+            future_df["value_rolling_max_24h"] = float(np.max(hist_vals))
+            future_df["value_rolling_min_24h"] = float(np.min(hist_vals))
+            future_df["value_range_24h"] = float(np.max(hist_vals) - np.min(hist_vals))
+
+        # ── 补齐高级天气衍生特征 (与 WeatherFeatureEngineer 对齐) ──
+        temp = future_df.get("temperature", pd.Series(20, index=future_df.index))
+        hum = future_df.get("humidity", pd.Series(50, index=future_df.index))
+        wind = future_df.get("wind_speed", pd.Series(3, index=future_df.index))
+        solar = future_df.get("solar_radiation", pd.Series(0, index=future_df.index))
+        press = future_df.get("pressure", pd.Series(1013, index=future_df.index))
+
+        future_df["CDD"] = np.maximum(temp.values - 26, 0)
+        future_df["HDD"] = np.maximum(18 - temp.values, 0)
+        future_df["THI"] = 0.8 * temp.values + 0.2 * hum.values * temp.values / 100.0
+        future_df["wind_power_potential"] = 0.5 * 1.225 * np.maximum(wind.values, 0) ** 3
+        future_df["solar_potential"] = solar.values / 1000.0
+        future_df["solar_efficiency"] = np.clip(1.0 - 0.005 * (temp.values - 25), 0.5, 1.0)
+
+        # 天气 lag/diff (用 history 尾部同时刻填充)
+        if "solar_radiation" in history.columns:
+            hist_solar = history["solar_radiation"].values
+            for i in range(len(future_df)):
+                pos_1d = n_hist - 96 + i
+                future_df.loc[future_df.index[i], "solar_radiation_lag_1d"] = (
+                    float(hist_solar[pos_1d]) if 0 <= pos_1d < n_hist else float(solar.iloc[i]))
+                future_df.loc[future_df.index[i], "solar_radiation_diff_1d"] = (
+                    float(solar.iloc[i]) - future_df.loc[future_df.index[i], "solar_radiation_lag_1d"])
+
+        if "wind_speed" in history.columns:
+            hist_wind = history["wind_speed"].values
+            for i in range(len(future_df)):
+                pos_1d = n_hist - 96 + i
+                future_df.loc[future_df.index[i], "wind_speed_lag_1d"] = (
+                    float(hist_wind[pos_1d]) if 0 <= pos_1d < n_hist else float(wind.iloc[i]))
+                future_df.loc[future_df.index[i], "wind_speed_diff_1d"] = (
+                    float(wind.iloc[i]) - future_df.loc[future_df.index[i], "wind_speed_lag_1d"])
+
+        if "temperature" in history.columns:
+            hist_temp = history["temperature"].values
+            n_temp = len(hist_temp)
+            for i in range(len(future_df)):
+                pos_1d = n_temp - 96 + i
+                pos_1h = n_temp - 4 + i
+                pos_6h = n_temp - 24 + i
+                future_df.loc[future_df.index[i], "temperature_lag_1d"] = (
+                    float(hist_temp[pos_1d]) if 0 <= pos_1d < n_temp else float(temp.iloc[i]))
+                future_df.loc[future_df.index[i], "temperature_diff_1d"] = (
+                    float(temp.iloc[i]) - future_df.loc[future_df.index[i], "temperature_lag_1d"])
+                future_df.loc[future_df.index[i], "temp_change_1h"] = (
+                    float(temp.iloc[i]) - float(hist_temp[pos_1h])
+                    if 0 <= pos_1h < n_temp else 0.0)
+                future_df.loc[future_df.index[i], "temp_change_6h"] = (
+                    float(temp.iloc[i]) - float(hist_temp[pos_6h])
+                    if 0 <= pos_6h < n_temp else 0.0)
+
+        # 连续高温天数 (简单近似: 最近 history 中的连续高温)
+        if "temperature" in history.columns:
+            hist_temp_vals = history["temperature"].values[-96:]
+            hot_streak = 0
+            for t_val in reversed(hist_temp_vals):
+                if t_val > 30:
+                    hot_streak += 1
+                else:
+                    break
+            future_df["consecutive_hot_days"] = float(hot_streak // 96)
+        else:
+            future_df["consecutive_hot_days"] = 0.0
+
+        # ── 补齐 working_day_type (从节假日模块) ──
+        if "is_work_weekend" in future_df.columns:
+            future_df["working_day_type"] = future_df["is_work_weekend"].astype(int) * 2 + (~future_df["is_weekend"]).astype(int)
+        else:
+            future_df["working_day_type"] = (~future_df["is_weekend"]).astype(int)
+
+        # ── 补齐交叉类型特征 (从 store 加载其他类型最近数据) ──
+        cross_types = [
+            "出力_光伏_实际", "出力_总_实际", "出力_水电含抽蓄_实际",
+            "出力_联络线_实际", "出力_非市场_实际", "出力_风电_实际", "负荷_系统_实际",
+        ]
+        for ct in cross_types:
+            try:
+                ct_data = self.store.load_features(
+                    province, ct,
+                    (base_dt - timedelta(days=14)).strftime("%Y-%m-%d"),
+                    (base_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
+                )
+                if ct_data is not None and not ct_data.empty and "value" in ct_data.columns:
+                    ct_vals = ct_data["value"].values
+                    n_ct = len(ct_vals)
+                    for i in range(len(future_df)):
+                        # value: 最近96步的对应时刻值
+                        pos = n_ct - 96 + i
+                        if 0 <= pos < n_ct:
+                            future_df.loc[future_df.index[i], f"{ct}_value"] = float(ct_vals[pos])
+                        else:
+                            future_df.loc[future_df.index[i], f"{ct}_value"] = float(np.mean(ct_vals[-96:]) if n_ct >= 96 else np.mean(ct_vals))
+                        # lag_1d: 96步前
+                        lag1_pos = n_ct - 192 + i
+                        if 0 <= lag1_pos < n_ct:
+                            future_df.loc[future_df.index[i], f"{ct}_lag_1d"] = float(ct_vals[lag1_pos])
+                        else:
+                            future_df.loc[future_df.index[i], f"{ct}_lag_1d"] = float(np.mean(ct_vals[-96:]) if n_ct >= 96 else np.mean(ct_vals))
+                        # lag_7d: 672步前
+                        lag7_pos = n_ct - 768 + i
+                        if 0 <= lag7_pos < n_ct:
+                            future_df.loc[future_df.index[i], f"{ct}_lag_7d"] = float(ct_vals[lag7_pos])
+                        else:
+                            future_df.loc[future_df.index[i], f"{ct}_lag_7d"] = float(np.mean(ct_vals[-96:]) if n_ct >= 96 else np.mean(ct_vals))
+            except Exception:
+                # 如果某类型数据不可用，填0
+                for suffix in ["_value", "_lag_1d", "_lag_7d"]:
+                    col_name = f"{ct}{suffix}"
+                    if col_name not in future_df.columns:
+                        future_df[col_name] = 0.0
+
+        # ── 补齐价格衍生特征 ──
+        # 用 value_lag_1d 作为当前 value 的近似（因为未来值未知）
+        proxy_value = future_df["value_lag_1d"].values
+
+        # price_per_load / price_x_load
+        load_col = "负荷_系统_实际_value"
+        if load_col in future_df.columns:
+            load_vals = future_df[load_col].replace(0, np.nan).values
+            future_df["price_per_load"] = proxy_value / np.where(np.isnan(load_vals), 1.0, np.maximum(load_vals, 1.0))
+            future_df["price_x_load"] = proxy_value * np.nan_to_num(load_vals, nan=0)
+        else:
+            # fallback: 从 history 推断
+            if load_col in future_df.columns:
+                load_vals = future_df[load_col].fillna(0).values
+            else:
+                # 从 history 的 value_rolling_mean 近似
+                load_vals = np.full(len(future_df), float(np.mean(hist_vals[-96:]) if n_hist >= 96 else last_value))
+            future_df["price_per_load"] = proxy_value / np.maximum(np.abs(load_vals), 1.0)
+            future_df["price_x_load"] = proxy_value * load_vals
+
+        # renewable_share / price_x_re_share
+        wind_col = "出力_风电_实际_value"
+        solar_col = "出力_光伏_实际_value"
+        total_out_col = "出力_总_实际_value"
+        if all(c in future_df.columns for c in [wind_col, solar_col, total_out_col]):
+            re_total = future_df[wind_col].fillna(0) + future_df[solar_col].fillna(0)
+            total_out = future_df[total_out_col].replace(0, np.nan).fillna(1)
+            future_df["renewable_share"] = (re_total / total_out).clip(0, 1)
+            future_df["price_x_re_share"] = proxy_value * (1 - future_df["renewable_share"])
+            future_df["renewable_penetration"] = future_df["renewable_share"]
+        else:
+            future_df["renewable_share"] = 0.0
+            future_df["price_x_re_share"] = 0.0
+            future_df["renewable_penetration"] = 0.0
+
+        # supply_demand_ratio / supply_surplus
+        if total_out_col in future_df.columns and load_col in future_df.columns:
+            supply = future_df[total_out_col].fillna(0)
+            demand = future_df[load_col].replace(0, np.nan).fillna(1)
+            future_df["supply_demand_ratio"] = supply / demand
+            future_df["supply_surplus"] = supply - demand.fillna(0)
+        else:
+            future_df["supply_demand_ratio"] = 0.0
+            future_df["supply_surplus"] = 0.0
+
+        # price momentum (用 proxy_value 的 diff)
+        future_df["price_momentum_1h"] = 0.0
+        future_df["price_momentum_6h"] = 0.0
+        future_df["price_momentum_24h"] = 0.0
+        for i in range(len(future_df)):
+            if i >= 4:
+                future_df.loc[future_df.index[i], "price_momentum_1h"] = float(proxy_value[i] - proxy_value[i-4])
+            if i >= 24:
+                future_df.loc[future_df.index[i], "price_momentum_6h"] = float(proxy_value[i] - proxy_value[i-24])
+            if i >= 96:
+                future_df.loc[future_df.index[i], "price_momentum_24h"] = float(proxy_value[i] - proxy_value[i-96])
+
+        # price_vol (用 proxy_value 的滚动 std/mean)
+        if n_hist >= 96:
+            hist_vol_24h = float(np.std(hist_vals[-96:]) / (np.mean(np.abs(hist_vals[-96:])) + 0.01))
+            future_df["price_vol_24h"] = hist_vol_24h
+        else:
+            future_df["price_vol_24h"] = 0.0
+        if n_hist >= 672:
+            hist_vol_7d = float(np.std(hist_vals[-672:]) / (np.mean(np.abs(hist_vals[-672:])) + 0.01))
+            future_df["price_vol_7d"] = hist_vol_7d
+        else:
+            future_df["price_vol_7d"] = future_df["price_vol_24h"].iloc[0] if len(future_df) > 0 else 0.0
+
+        # price_position (在日内波动中的相对位置, 用 proxy 近似)
+        proxy_min = np.min(proxy_value)
+        proxy_max = np.max(proxy_value)
+        proxy_range = max(proxy_max - proxy_min, 1.0)
+        future_df["price_position"] = (proxy_value - proxy_min) / proxy_range
+
+        # peak_off_peak_spread (从 history 计算)
+        peak_mask = future_df["peak_valley"] == 2
+        off_mask = future_df["peak_valley"] == 0
+        peak_vals = proxy_value[peak_mask.values]
+        off_vals = proxy_value[off_mask.values]
+        if len(peak_vals) > 0 and len(off_vals) > 0:
+            future_df["peak_off_peak_spread"] = float(np.mean(peak_vals) - np.mean(off_vals))
+        else:
+            future_df["peak_off_peak_spread"] = 0.0
+
+        # ── 补齐误差修正特征 (未来无预测, 全部初始化为0) ──
+        error_cols = [
+            "pred_error", "pred_error_lag_1d", "pred_error_lag_7d",
+            "pred_error_bias_24h", "pred_error_std_24h", "pred_error_trend",
+            "interval_coverage", "coverage_rate_24h",
+            "pred_error_hour_bias", "pred_error_weekend", "pred_error_holiday",
+            "pred_error_x_temp", "pred_error_x_wind",
+            "pred_error_autocorr", "pred_error_regime",
+        ]
+        for ec in error_cols:
+            if ec not in future_df.columns:
+                future_df[ec] = 0.0
+
+        # ── NaN 填充 ──
         for col in future_df.columns:
             if col not in ("dt", "province", "type") and future_df[col].dtype == np.float64:
                 future_df[col] = future_df[col].fillna(
@@ -494,9 +734,10 @@ class Predictor:
                             feature_names: List[str], province: str,
                             target_type: str,
                             history: pd.DataFrame = None) -> pd.DataFrame:
-        for fn in feature_names:
-            if fn not in features_df.columns:
-                features_df[fn] = 0.0
+        missing = [fn for fn in feature_names if fn not in features_df.columns]
+        if missing:
+            missing_df = pd.DataFrame(0.0, index=features_df.index, columns=missing)
+            features_df = pd.concat([features_df, missing_df], axis=1)
         predict_features = features_df[feature_names].copy()
         predicted = model.predict(predict_features)
 
@@ -730,18 +971,28 @@ class Predictor:
                 # 混合模型区间 + 残差区间
                 model_lo = ensemble["p50"].values - ensemble["p10"].values
                 model_hi = ensemble["p90"].values - ensemble["p50"].values
-                final_lo = 0.3 * model_lo + 0.7 * cal_lo
-                final_hi = 0.3 * model_hi + 0.7 * cal_hi
+
+                # 分位数模型已有独立的 P10/P90, 更信任模型; 单模型回退则更依赖历史残差
+                is_quantile = ensemble.get("model_version", [""]).iloc[0] == "quantile_v1"
+                mw = 0.7 if is_quantile else 0.3
+                cw = 1.0 - mw
+                final_lo = mw * model_lo + cw * cal_lo
+                final_hi = mw * model_hi + cw * cal_hi
 
                 # 时序衰减扩容: 越远的预测越不确定
                 horizon_factor = 1.0 + 0.4 * np.arange(n) / max(n, 1)
                 final_lo *= horizon_factor
                 final_hi *= horizon_factor
 
+                # 硬下限: 不低于 P50 的 3% (避免区间过窄失去参考价值)
+                floor = np.abs(p50_vals) * 0.03
+                final_lo = np.maximum(final_lo, floor)
+                final_hi = np.maximum(final_hi, floor)
+
                 # 上限: 不超过 P50 的 3x
                 cap = np.abs(p50_vals) * 3.0
-                final_lo = np.minimum(np.abs(final_lo), cap)
-                final_hi = np.minimum(np.abs(final_hi), cap)
+                final_lo = np.minimum(final_lo, cap)
+                final_hi = np.minimum(final_hi, cap)
 
                 allow_neg = self._allow_negative(target_type)
                 raw_p10 = ensemble["p50"].values - final_lo
