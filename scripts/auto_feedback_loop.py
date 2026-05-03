@@ -1,22 +1,21 @@
 """auto_feedback_loop.py — 版本化自动反馈闭环
 
-openclaw 目录结构:
-  v{N}/                          ← 版本 N 的预测结果
-  v{N}/evaluation_report.md      ← 用户放入的评估报告
-  v{N}/improvement_suggestions.md ← 用户放入的整改建议
-  v{N}/.processed                ← 标记已处理（空文件）
-  v{N}/.skipped                  ← 标记跳过（不值得改）
+目录约定:
+  /Users/pcy/ai/claude/v{N}/     ← 预测结果输出
+  /Users/pcy/ai/openclaw/v{N}/   ← 用户反馈输入 (evaluation_report.md + improvement_suggestions.md)
+  openclaw/v{N}/.processed       ← 标记已处理
+  openclaw/v{N}/.skipped         ← 标记跳过
 
-工作流: 检测到新版本 → 分析建议 → 整改 → push → 预测到 v{N+1}
+工作流: 检测到 openclaw/v{N} 有新反馈 → 分析建议 → 整改 → push → 预测到 claude/v{N+1}
 """
 
 import os
 import sys
-import glob
 import json
 from datetime import datetime
 
 OPENCLAW = "/Users/pcy/ai/openclaw"
+CLAUDE_DIR = "/Users/pcy/ai/claude"
 PROJ_DIR = "/Users/pcy/analysSkills"
 
 
@@ -68,7 +67,7 @@ def run_predictions(version: int):
     sys.path.insert(0, PROJ_DIR)
     from scripts.ml.predictor import Predictor
 
-    out_dir = os.path.join(OPENCLAW, f"v{version}")
+    out_dir = os.path.join(CLAUDE_DIR, f"v{version}")
     os.makedirs(out_dir, exist_ok=True)
 
     with open(os.path.join(PROJ_DIR, "models/model_registry.json")) as f:
