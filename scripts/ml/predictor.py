@@ -221,12 +221,14 @@ class Predictor:
         if len(values) == 0:
             return np.zeros(horizon_steps)
 
-        # 波动型: Holt线性外推不可靠, 用昨日同时刻值作为趋势基线
+        # 波动型: Holt线性外推不可靠, 用多日平均日内模式作为趋势基线
         VOLATILE_TREND_TYPES = ["风电", "联络线", "非市场"]
-        if any(kw in target_type for kw in VOLATILE_TREND_TYPES) and len(values) >= 96:
-            yesterday = values[-96:]
+        if any(kw in target_type for kw in VOLATILE_TREND_TYPES) and len(values) >= 96 * 3:
+            days = min(len(values) // 96, 7)
+            reshaped = values[-days * 96:].reshape(days, 96)
+            pattern = np.mean(reshaped, axis=0)
             repeats = horizon_steps // 96 + 1
-            return np.tile(yesterday, repeats)[:horizon_steps]
+            return np.tile(pattern, repeats)[:horizon_steps]
 
         trend_model = TrendModel()
         trend_model.fit(values)
