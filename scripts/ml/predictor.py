@@ -95,14 +95,13 @@ class Predictor:
             history, province, target_type, horizon_steps, end_date
         )
 
-        # ── 尝试分位数模型 ──
+        # ── LGB 分位数模型 ──
         quantile_models = None
         feature_names = None
         try:
             quantile_models = self.trainer.load_quantile_models(province, target_type)
             predictions = self._predict_quantile(quantile_models, future_features,
                                                   province, target_type)
-            # 取 P50 模型的特征名用于后续 ECM
             _, feature_names = quantile_models.get("p50", (None, None))
         except (FileNotFoundError, KeyError):
             model, feature_names, _ = self.trainer.load_model(province, target_type)
@@ -111,7 +110,18 @@ class Predictor:
                 province=province, target_type=target_type, history=history,
             )
 
-        # ── 迭代 lag 回填：用前一批预测更新后续 lag 特征 ──
+        # ── XGBoost 模型 (P50) ──
+        xgb_p50 = None
+        try:
+            xgb_model, _ = self.trainer.load_xgboost_model(province, target_type)
+            for fn in feature_names:
+                if fn not in future_features.columns:
+                    future_features[fn] = 0.0
+            xgb_p50 = xgb_model.predict(future_features[feature_names].values)
+        except (FileNotFoundError, KeyError):
+            pass
+
+        # ── 迭代 lag 回填 ──
         if horizon_steps > 96:
             predictions = self._iterative_lag_backfill(
                 predictions, future_features, history,
@@ -120,9 +130,18 @@ class Predictor:
             )
 
         trend_pred = self._predict_trend(history, horizon_steps)
-        ensemble = self._ensemble(predictions, trend_pred, history, target_type)
+        ensemble = self._ensemble(predictions, trend_pred, history, target_type,
+                                  xgb_p50=xgb_p50)
 
-        # ECM 残差修正 — v2: 用 LGB 历史残差拟合 AR，而非原始 value
+        # 光伏残差还原: 模型预测的是 value - value_lag_1d, 加回基线
+        if "光伏" in target_type and "value_lag_1d" in future_features.columns:
+            n_ens = len(ensemble)
+            lag1d = future_features["value_lag_1d"].values[:n_ens]
+            for col in ["p10", "p50", "p90"]:
+                if col in ensemble.columns:
+                    ensemble[col] = lag1d + ensemble[col].values
+
+        # ECM 残差修正
         if len(history) > 200 and "value" in history.columns and feature_names:
             try:
                 ensemble = self._apply_ecm_correction(
@@ -134,6 +153,27 @@ class Predictor:
 
         # 自适应区间校准
         ensemble = self._calibrate_intervals(ensemble, history, province, target_type)
+
+        # 光伏夜间归零 — 树模型无法硬归零，后处理修复
+        if "光伏" in target_type and "dt" in ensemble.columns:
+            hours = pd.to_datetime(ensemble["dt"]).dt.hour
+            night_mask = (hours < 6) | (hours >= 20)
+            for col in ["p10", "p50", "p90"]:
+                if col in ensemble.columns:
+                    ensemble.loc[night_mask, col] = 0.0
+
+        # 抽水蓄能方向感知 — 值接近零时用近期符号
+        if "水电含抽蓄" in target_type and "dt" in ensemble.columns:
+            # 对 P50 接近零的步，倾向于维持最近已知方向
+            p50_vals = ensemble["p50"].values
+            near_zero = np.abs(p50_vals) < 50.0
+            if near_zero.any() and "value" in history.columns:
+                recent_sign = np.sign(history["value"].tail(96).mean())
+                if abs(recent_sign) > 0.1:
+                    # 保留符号信息：接近零的预测值向最近趋势方向偏移
+                    ensemble.loc[near_zero, "p50"] = (
+                        ensemble.loc[near_zero, "p50"] + recent_sign * 20
+                    )
 
         self.store.insert_predictions(ensemble)
 
@@ -184,16 +224,35 @@ class Predictor:
     def _ensemble(self, lgb_result: pd.DataFrame,
                   trend_preds: np.ndarray,
                   history: pd.DataFrame,
-                  target_type: str = "load") -> pd.DataFrame:
+                  target_type: str = "load",
+                  xgb_p50: np.ndarray = None) -> pd.DataFrame:
+        """集成预测: LGB + (XGB) + Trend 加权平均.
+
+        有 XGBoost 时: LGB 0.45 + XGB 0.25 + Trend 0.30 (初始, 按时序衰减)
+        无 XGBoost 时: LGB 0.85 + Trend 0.15 → LGB 0.45 + Trend 0.55 (96步后)
+        """
         n = len(lgb_result)
         trend_preds = trend_preds[:n]
-        lgb_weight = np.array([max(self._lgb_weight_min,
-                                    0.85 - self._lgb_weight_decay * i) for i in range(n)])
-        trend_weight = 1.0 - lgb_weight
         lgb_p50 = lgb_result["p50"].values
-        ensemble_p50 = lgb_weight * lgb_p50 + trend_weight * trend_preds
-        result = lgb_result.copy()
         allow_neg = self._allow_negative(target_type)
+
+        if xgb_p50 is not None and len(xgb_p50) >= n:
+            xgb_p50 = xgb_p50[:n]
+            if not allow_neg:
+                xgb_p50 = np.maximum(xgb_p50, 0)
+            # 3-way: LGB + XGB + Trend
+            lgb_w = np.array([max(self._lgb_weight_min, 0.50 - self._lgb_weight_decay * i) for i in range(n)])
+            xgb_w = np.full(n, 0.25)
+            trend_w = 1.0 - lgb_w - xgb_w
+            ensemble_p50 = lgb_w * lgb_p50 + xgb_w * xgb_p50 + trend_w * trend_preds
+        else:
+            # 2-way: LGB + Trend (回退)
+            lgb_w = np.array([max(self._lgb_weight_min,
+                                  0.85 - self._lgb_weight_decay * i) for i in range(n)])
+            trend_w = 1.0 - lgb_w
+            ensemble_p50 = lgb_w * lgb_p50 + trend_w * trend_preds
+
+        result = lgb_result.copy()
         result["p50"] = ensemble_p50 if allow_neg else np.maximum(ensemble_p50, 0)
         p50_shift = result["p50"].values - lgb_p50
         result["p10"] = lgb_result["p10"].values + p50_shift
@@ -263,6 +322,17 @@ class Predictor:
             lag7_val = row.get("value_lag_7d", last_value)
             row["value_diff_1d"] = float(last_value - lag1_val) if last_value and lag1_val else 0.0
             row["value_diff_7d"] = float(last_value - lag7_val) if last_value and lag7_val else 0.0
+
+            # 方向特征 (抽水蓄能等双向运行类型)
+            row["value_sign"] = float(np.sign(last_value)) if n_hist > 0 else 0.0
+            # value_sign_lag_1d: 从历史查找对应96步前的符号
+            sign1d_pos = n_hist - 96 + i
+            if sign1d_pos >= 0 and sign1d_pos < n_hist:
+                row["value_sign_lag_1d"] = float(np.sign(hist_vals[sign1d_pos]))
+            else:
+                row["value_sign_lag_1d"] = row["value_sign"]
+            row["value_sign_change"] = 1.0 if abs(row["value_sign"] - row["value_sign_lag_1d"]) > 0.5 else 0.0
+
             rows.append(row)
         future_df = pd.DataFrame(rows)
 
@@ -280,6 +350,23 @@ class Predictor:
         future_df["dow_hour"] = future_df["day_of_week"] * 24 + future_df["hour"]
         future_df["weekend_x_lag7d"] = future_df["is_weekend"].astype(int) * future_df["value_lag_7d"]
         future_df["hour_x_lag1d"] = future_df["hour"] * future_df["value_lag_1d"]
+
+        # ── 白天/黑夜 + 时段细分 ──
+        future_df["is_daylight"] = future_df["hour"].apply(lambda h: 1 if 6 <= h <= 18 else 0)
+        future_df["time_of_day"] = future_df["hour"].apply(
+            lambda h: 0 if h >= 22 or h < 6 else
+                      1 if 6 <= h < 9 else
+                      2 if 9 <= h < 12 else
+                      3 if 12 <= h < 15 else
+                      4 if 15 <= h < 18 else 5
+        )
+        future_df["season_x_tod"] = future_df["season"] * 6 + future_df["time_of_day"]
+        if "temperature" in future_df.columns:
+            _tb = pd.cut(future_df["temperature"].fillna(20),
+                bins=[-100, 0, 10, 20, 30, 40, 100],
+                labels=[0, 1, 2, 3, 4, 5], include_lowest=True).astype(int)
+            future_df["daylight_x_temp"] = future_df["is_daylight"].astype(int) * 6 + _tb.astype(int)
+        future_df["weekend_x_tod"] = future_df["is_weekend"].astype(int) * 6 + future_df["time_of_day"]
         # 气象列 fallback: 最近7天同时刻均值 (比全量均值更准)
         weather_cols = ["temperature", "humidity", "wind_speed", "wind_direction",
                         "solar_radiation", "precipitation", "pressure"]
@@ -317,6 +404,86 @@ class Predictor:
                 future_df.drop(columns=["dt_merge"], inplace=True, errors="ignore")
         except Exception as e:
             logger.warning("气象数据获取失败 (%s/%s): %s", province, target_type, e)
+
+        # ── 派生天气特征: 温度极端度 + 时段×极端度交互 ──
+        if "temperature" in future_df.columns:
+            future_df["temp_extremity"] = np.abs(future_df["temperature"] - 22) / 15
+            if "humidity" in future_df.columns:
+                hum_factor = 1.0 + np.clip((future_df["humidity"] - 50) / 100, -0.2, 0.3)
+                future_df["temp_extremity"] = future_df["temp_extremity"] * hum_factor
+            _te = pd.cut(future_df["temp_extremity"].fillna(0.5),
+                bins=[0, 0.2, 0.5, 1.0, 100],
+                labels=[0, 1, 2, 3], include_lowest=True).astype(int)
+            future_df["tod_x_temp_extreme"] = future_df["time_of_day"] * 4 + _te.astype(int)
+
+        # ── cloud_factor: 实际/晴空辐照度, 剥离昼夜循环 ──
+        if "solar_radiation" in future_df.columns:
+            from scripts.core.config import load_config
+            from scripts.data.weather_features import WeatherFeatureEngineer
+            coords = load_config().get("province_coords", {})
+            lat = coords.get(province, {}).get("lat") if coords else None
+            if lat is not None:
+                dts = pd.to_datetime(future_df["dt"])
+                doy = dts.dt.dayofyear.values
+                hrs = dts.dt.hour.values + dts.dt.minute.values / 60.0
+                clear_sky = np.array([
+                    WeatherFeatureEngineer._clear_sky_irradiance(lat, int(d), float(h))
+                    for d, h in zip(doy, hrs)
+                ])
+                mask = clear_sky > 10
+                cf = np.zeros(len(clear_sky))
+                cf[mask] = np.clip(
+                    future_df["solar_radiation"].values[mask] / clear_sky[mask],
+                    0.0, 1.5
+                )
+                future_df["cloud_factor"] = cf
+            else:
+                future_df["cloud_factor"] = 0.0
+        else:
+            future_df["cloud_factor"] = 0.0
+
+        # ── 极端天气标志 (未来行) ──
+        if "temperature" in future_df.columns:
+            t_mean = history["temperature"].mean() if "temperature" in history.columns else 22
+            t_std = history["temperature"].std() if "temperature" in history.columns else 5
+            t_std = max(t_std, 0.1)
+            future_df["temp_zscore"] = (future_df["temperature"] - t_mean) / t_std
+            future_df["is_heat_wave"] = ((future_df["temperature"] > 35) & (future_df["temp_zscore"] > 2)).astype(int)
+            future_df["is_cold_snap"] = ((future_df["temperature"] < -5) & (future_df["temp_zscore"] < -2)).astype(int)
+
+        # 极端天气综合标志
+        extreme_fut = pd.DataFrame(index=future_df.index)
+        extreme_fut["hw"] = future_df.get("is_heat_wave", 0)
+        extreme_fut["cs"] = future_df.get("is_cold_snap", 0)
+        extreme_fut["sw"] = (future_df.get("wind_speed", 0) > 15).astype(int)
+        extreme_fut["hp"] = (future_df.get("precipitation", 0) > 25).astype(int)
+        future_df["extreme_weather_flag"] = (extreme_fut.sum(axis=1) > 0).astype(int)
+        future_df["extreme_weather_count"] = extreme_fut.sum(axis=1).astype(int)
+
+        # ── 极端值统计特征 (未来行从 history 推导) ──
+        if "value" in history.columns:
+            hist_vals = history["value"].dropna()
+            if len(hist_vals) >= 96:
+                rmean = hist_vals.iloc[-96:].mean()
+                rstd = max(hist_vals.iloc[-96:].std(), 0.01)
+                future_df["value_zscore_24h"] = 0.0  # 未来值未知, 设为0
+                future_df["value_percentile_7d"] = 0.5
+            else:
+                future_df["value_zscore_24h"] = 0.0
+                future_df["value_percentile_7d"] = 0.5
+        else:
+            future_df["value_zscore_24h"] = 0.0
+            future_df["value_percentile_7d"] = 0.5
+
+        # ── 极端×时间交互 ──
+        future_df["extreme_x_tod"] = future_df["extreme_weather_flag"] * future_df["time_of_day"]
+        future_df["heat_wave_x_daylight"] = future_df["is_heat_wave"] * future_df["is_daylight"]
+        if "temp_zscore" in future_df.columns:
+            future_df["tzscore_x_tod"] = future_df["temp_zscore"] * future_df["time_of_day"]
+        future_df["val_extreme_x_weather"] = (
+            np.abs(future_df["value_zscore_24h"]) * future_df["extreme_weather_flag"]
+        )
+
         for col in future_df.columns:
             if col not in ("dt", "province", "type") and future_df[col].dtype == np.float64:
                 future_df[col] = future_df[col].fillna(
@@ -332,6 +499,10 @@ class Predictor:
                 features_df[fn] = 0.0
         predict_features = features_df[feature_names].copy()
         predicted = model.predict(predict_features)
+
+        # 光伏残差还原: 模型预测的是 value - value_lag_1d, 加回基线
+        if "光伏" in target_type and "value_lag_1d" in features_df.columns:
+            predicted = predicted + features_df["value_lag_1d"].values
 
         # 历史残差分布估算 P10/P90 (P05/P95 残差分位数 + 地板 + 时序扩容)
         n = len(predicted)

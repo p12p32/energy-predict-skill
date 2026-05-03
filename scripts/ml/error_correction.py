@@ -114,19 +114,27 @@ class ErrorCorrectionModel:
         return np.array(predictions)
 
     def correct(self, lgb_predictions: np.ndarray,
-                recent_residuals: np.ndarray) -> np.ndarray:
-        """完整修正: LightGBM 预测 + AR 残差修正."""
+                recent_residuals: np.ndarray,
+                clip_ratio: float = 0.30) -> np.ndarray:
+        """完整修正: LightGBM 预测 + AR 残差修正.
+
+        clip_ratio: 残差修正上限 (相对P50绝对值), 防止极端偏差.
+        """
         ar_pred = self.predict(recent_residuals, len(lgb_predictions))
+        p50_abs = np.maximum(np.abs(lgb_predictions), 1.0)
+        max_correction = clip_ratio * p50_abs
+        ar_pred = np.clip(ar_pred, -max_correction, max_correction)
         return lgb_predictions + ar_pred
 
     def fit_and_correct(self, y_true: np.ndarray, y_pred_lgb: np.ndarray,
-                        horizon: int) -> Dict:
+                        horizon: int, clip_ratio: float = 0.30) -> Dict:
         """一站式: 拟合残差模型 + 修正预测.
 
         Args:
             y_true: 训练集的真实值
             y_pred_lgb: LightGBM 在训练集上的预测值
             horizon: 预测步数
+            clip_ratio: 残差修正上限 (相对P50绝对值)
 
         Returns:
             {"corrected": array, "ar_pred": array, "coefficients": array}
@@ -136,6 +144,9 @@ class ErrorCorrectionModel:
 
         recent = residuals[-self.order:]
         ar_pred = self.predict(recent, horizon)
+        p50_abs = np.maximum(np.abs(y_pred_lgb[-horizon:]), 1.0)
+        max_correction = clip_ratio * p50_abs
+        ar_pred = np.clip(ar_pred, -max_correction, max_correction)
         corrected = y_pred_lgb[-horizon:] + ar_pred
 
         return {

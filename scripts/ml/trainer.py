@@ -1,9 +1,10 @@
-"""trainer.py — 模型训练器（LightGBM + 分位数回归 + 版本回滚 + 特征重要性）
+"""trainer.py — 模型训练器（LightGBM + XGBoost + 分位数回归 + 版本回滚 + 特征重要性）
 
 模型存储格式:
   - .lgbm       → LightGBM 原生文本格式 (booster_.save_model)
   - .lgbm.meta   → JSON 元数据 (feature_names 等)
   - .lgb          → 旧版 pickle 格式 (向后兼容，仅读取)
+  - .xgb.json    → XGBoost 原生 JSON 格式 (model.save_model)
 """
 import os
 import json
@@ -15,6 +16,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
+import xgboost as xgb
 from sklearn.model_selection import TimeSeriesSplit
 
 from scripts.core.config import get_model_config, load_config
@@ -96,8 +98,13 @@ class Trainer:
         raise FileNotFoundError(f"模型文件不存在: {path} or {lgbm_path}")
 
     def prepare_training_data(self, df: pd.DataFrame,
-                               target_col: str = "value") -> Tuple[pd.DataFrame, pd.Series]:
-        """准备训练数据，自动过滤非实际值."""
+                               target_col: str = "value",
+                               target_type: str = None) -> Tuple[pd.DataFrame, pd.Series]:
+        """准备训练数据，自动过滤非实际值.
+
+        光伏类型: 目标自动切换为 value - value_lag_1d (残差建模),
+        让天气特征直接解释日间变化量, 而非与自回归特征竞争.
+        """
         df = df.dropna(subset=[target_col]).copy()
 
         # value_type 过滤: 只用实际值训练
@@ -114,13 +121,21 @@ class Trainer:
             if c not in EXCLUDE_COLS and c != target_col
         ]
         X = df[feature_cols].select_dtypes(include=[np.number])
-        y = df[target_col]
+
+        # 光伏残差建模: 训练目标 = 日间变化量
+        if target_type and "光伏" in target_type and "value_lag_1d" in df.columns:
+            lag1d = df["value_lag_1d"].fillna(0)
+            y = df[target_col] - lag1d
+            logger.info("光伏残差建模: target = value - value_lag_1d (均值=%.2f, std=%.2f)",
+                        y.mean(), y.std())
+        else:
+            y = df[target_col]
         return X, y
 
     def train(self, df: pd.DataFrame, province: str,
               target_type: str, target_col: str = "value",
               params: Dict = None, model_filename: str = None) -> Dict:
-        X, y = self.prepare_training_data(df, target_col)
+        X, y = self.prepare_training_data(df, target_col, target_type)
 
         lgb_params = {
             "objective": "quantile",
@@ -181,7 +196,7 @@ class Trainer:
     def quick_train(self, df: pd.DataFrame, province: str,
                     target_type: str, target_col: str = "value",
                     params: Dict = None) -> Dict:
-        X, y = self.prepare_training_data(df, target_col)
+        X, y = self.prepare_training_data(df, target_col, target_type)
         cfg = load_config()
         tc = cfg.get("trainer", {})
         lgb_params = {
@@ -205,12 +220,77 @@ class Trainer:
             "target_type": target_type,
         }
 
+    def xgboost_train(self, df: pd.DataFrame, province: str,
+                      target_type: str, target_col: str = "value",
+                      params: Dict = None) -> Dict:
+        """训练 XGBoost 分位数回归模型 (P50)."""
+        X, y = self.prepare_training_data(df, target_col, target_type)
+        cfg = load_config()
+        tc = cfg.get("trainer", {})
+        xgb_params = {
+            "objective": "reg:quantileerror",
+            "quantile_alpha": 0.5,
+            "max_depth": tc.get("xgb_max_depth", 7),
+            "learning_rate": tc.get("xgb_learning_rate", 0.03),
+            "n_estimators": tc.get("xgb_n_estimators", 500),
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+            "reg_alpha": 0.1,
+            "reg_lambda": 1.0,
+            "verbosity": 0,
+        }
+        if params:
+            xgb_params.update(params)
+        model = xgb.XGBRegressor(**xgb_params)
+        model.fit(X, y)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_filename = f"{province}_{target_type}_xgb_{timestamp}.json"
+        province_dir = os.path.join(self.model_dir, province)
+        os.makedirs(province_dir, exist_ok=True)
+        model_path = os.path.join(province_dir, model_filename)
+        model.save_model(model_path)
+
+        self._update_registry(province, target_type,
+                              model_filename, list(X.columns), model_path,
+                              model_type="xgb")
+
+        return {
+            "model": model,
+            "feature_names": list(X.columns),
+            "n_samples": len(df), "province": province,
+            "target_type": target_type, "model_path": model_path,
+        }
+
+    def load_xgboost_model(self, province: str, target_type: str,
+                           version: int = -1) -> Tuple[xgb.XGBRegressor, List[str]]:
+        """加载 XGBoost 模型."""
+        registry = self._read_registry()
+        key = f"{province}_{target_type}"
+        if key not in registry:
+            raise FileNotFoundError(f"未找到模型: {key}")
+
+        entry = registry[key]
+        xgb_versions = entry.get("xgb_versions", [])
+        if not xgb_versions:
+            raise FileNotFoundError(f"未找到 XGBoost 模型: {key}")
+
+        idx = version if version == -1 else min(version, len(xgb_versions) - 1)
+        model_filename = xgb_versions[idx]
+        model_path = os.path.join(self.model_dir, province, model_filename)
+
+        model = xgb.XGBRegressor()
+        model.load_model(model_path)
+        feature_names = entry.get("feature_names", [])
+
+        return model, feature_names
+
     def quantile_train(self, df: pd.DataFrame, province: str,
                        target_type: str, target_col: str = "value") -> Dict:
         """训练 P10/P50/P90 三个分位数模型.
         返回: {"models": {"p10": model, "p50": model, "p90": model}, ...}
         """
-        X, y = self.prepare_training_data(df, target_col)
+        X, y = self.prepare_training_data(df, target_col, target_type)
         tscv = TimeSeriesSplit(n_splits=3)
         _, val_idx = list(tscv.split(X))[-1]
         train_idx = np.setdiff1d(np.arange(len(X)), val_idx)
@@ -416,17 +496,22 @@ class Trainer:
 
     def _update_registry(self, province: str, target_type: str,
                          filename: str, feature_names: List[str],
-                         model_path: str):
+                         model_path: str, model_type: str = "lgb"):
         registry = self._read_registry()
         key = f"{province}_{target_type}"
 
-        old_versions = registry.get(key, {}).get("versions", [])
+        entry = registry.get(key, {})
+        if model_type == "xgb":
+            old_xgb = entry.get("xgb_versions", [])
+            entry["xgb_versions"] = (old_xgb + [filename])[-MAX_VERSIONS:]
+        else:
+            old_versions = entry.get("versions", [])
+            entry["versions"] = (old_versions + [filename])[-MAX_VERSIONS:]
 
-        registry[key] = {
-            "versions": (old_versions + [filename])[-MAX_VERSIONS:],
-            "feature_names": feature_names,
-            "updated_at": datetime.now().isoformat(),
-        }
+        entry["feature_names"] = feature_names
+        entry["updated_at"] = datetime.now().isoformat()
+        registry[key] = entry
+
         registry_path = os.path.join(self.model_dir, "model_registry.json")
         with open(registry_path, "w") as f:
             json.dump(registry, f, indent=2, ensure_ascii=False)

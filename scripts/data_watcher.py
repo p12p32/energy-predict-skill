@@ -219,7 +219,11 @@ class DataWatcher:
 
         features = self.engineer.build_features_from_raw(raw)
         if not weather.empty:
-            features = self.engineer.merge_weather(features, weather)
+            from scripts.core.config import load_config
+            cfg = load_config()
+            coords = cfg.get("province_coords", {})
+            lat = coords.get(province, {}).get("lat") if coords else None
+            features = self.engineer.merge_weather(features, weather, lat=lat)
 
         count = self.store.insert_features(features)
         msg = f"{province}/{dtype}: 新数据 {len(raw)} 行 → {count} 特征"

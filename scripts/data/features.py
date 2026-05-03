@@ -164,6 +164,33 @@ class FeatureEngineer:
         df["weekend_hour"] = df["is_weekend"].astype(int) * df["hour"]
         df["dow_hour"] = df["day_of_week"] * 24 + df["hour"]
 
+        # ── 白天/黑夜 + 时段细分 ──
+        df["is_daylight"] = df["hour"].apply(lambda h: 1 if 6 <= h <= 18 else 0)
+        df["time_of_day"] = df["hour"].apply(
+            lambda h: 0 if h >= 22 or h < 6 else      # 夜 (22-5)
+                      1 if 6 <= h < 9 else             # 晨峰爬坡 (6-8)
+                      2 if 9 <= h < 12 else            # 上午 (9-11)
+                      3 if 12 <= h < 15 else           # 午间 (12-14)
+                      4 if 15 <= h < 18 else           # 下午 (15-17)
+                      5                                 # 晚峰 (18-21)
+        )
+
+        # ── 高阶交互 ──
+        df["season_x_tod"] = df["season"] * 6 + df["time_of_day"]
+        if "temperature" in df.columns:
+            df["_temp_bucket"] = pd.cut(df["temperature"].fillna(20),
+                bins=[-100, 0, 10, 20, 30, 40, 100],
+                labels=[0, 1, 2, 3, 4, 5]).astype(int)
+            df["daylight_x_temp"] = df["is_daylight"].astype(int) * 6 + df["_temp_bucket"].astype(int)
+            df.drop(columns=["_temp_bucket"], inplace=True)
+        df["weekend_x_tod"] = df["is_weekend"].astype(int) * 6 + df["time_of_day"]
+        if "temp_extremity" in df.columns:
+            df["_te_bucket"] = pd.cut(df["temp_extremity"].fillna(0.5),
+                bins=[0, 0.2, 0.5, 1.0, 100],
+                labels=[0, 1, 2, 3], include_lowest=True).astype(int)
+            df["tod_x_temp_extreme"] = df["time_of_day"] * 4 + df["_te_bucket"].astype(int)
+            df.drop(columns=["_te_bucket"], inplace=True)
+
         # ── 滞后特征 (只在 实际 数据上计算，避免预测数据污染) ──
         actual_mask = df["value_type"] == value_type_filter
         for group_key, group_df in df[actual_mask].groupby(["province", "type"]):
@@ -176,6 +203,17 @@ class FeatureEngineer:
 
             df.loc[idx, "value_rolling_mean_24h"] = (
                 group_df["value"].rolling(window=96, min_periods=1).mean().values
+            )
+
+            # ── 方向特征 (抽水蓄能等双向运行类型) ──
+            signs = np.sign(group_df["value"].values)
+            df.loc[idx, "value_sign"] = signs
+            lagged = np.zeros(len(signs))
+            if len(signs) > 96:
+                lagged[96:] = signs[:-96]
+            df.loc[idx, "value_sign_lag_1d"] = lagged
+            df.loc[idx, "value_sign_change"] = (
+                (df.loc[idx, "value_sign"] != df.loc[idx, "value_sign_lag_1d"]).astype(int)
             )
 
         # ── 滞后交互特征 ──
@@ -200,6 +238,20 @@ class FeatureEngineer:
                 df.loc[idx, "value_rolling_max_24h"] - df.loc[idx, "value_rolling_min_24h"]
             )
 
+            # ── 极端值统计特征 ──
+            rstd = group_df["value"].rolling(window=96, min_periods=24).std()
+            rmean = group_df["value"].rolling(window=96, min_periods=24).mean()
+            df.loc[idx, "value_zscore_24h"] = (
+                (group_df["value"] - rmean) / rstd.replace(0, 1.0)
+            ).fillna(0).values
+            # 7日滚动百分位: 当前值在最近7天中的位置 (0=最低, 1=最高)
+            r7d = group_df["value"].rolling(window=672, min_periods=96)
+            df.loc[idx, "value_percentile_7d"] = (
+                group_df["value"].rolling(window=672, min_periods=96)
+                .apply(lambda x: (x < x.iloc[-1]).mean() if len(x) >= 96 else 0.5,
+                       raw=False).fillna(0.5).values
+            )
+
         # ── 天气×时间交互 ──
         if "temperature" in df.columns and "hour" in df.columns:
             df["temp_x_hour"] = df["temperature"] * df["hour"]
@@ -207,6 +259,18 @@ class FeatureEngineer:
             df["wind_x_season"] = df["wind_speed"] * df["season"]
         if "temperature" in df.columns and "humidity" in df.columns:
             df["temp_x_humidity"] = df["temperature"] * df["humidity"] / 100
+
+        # ── 极端天气×时间交互 ──
+        if "extreme_weather_flag" in df.columns and "time_of_day" in df.columns:
+            df["extreme_x_tod"] = df["extreme_weather_flag"] * df["time_of_day"]
+        if "is_heat_wave" in df.columns and "is_daylight" in df.columns:
+            df["heat_wave_x_daylight"] = df["is_heat_wave"] * df["is_daylight"]
+        if "temp_zscore" in df.columns and "time_of_day" in df.columns:
+            df["tzscore_x_tod"] = df["temp_zscore"] * df["time_of_day"]
+        if "value_zscore_24h" in df.columns and "extreme_weather_flag" in df.columns:
+            df["val_extreme_x_weather"] = (
+                np.abs(df["value_zscore_24h"]) * df["extreme_weather_flag"]
+            )
 
         # ── 初始化 pred_error 列为 0 (后续由 add_prediction_error_features 填充) ──
         for col in ["pred_error", "pred_error_lag_1d", "pred_error_lag_7d",
@@ -514,7 +578,8 @@ class FeatureEngineer:
         return result
 
     def merge_weather(self, features: pd.DataFrame,
-                      weather: pd.DataFrame) -> pd.DataFrame:
+                      weather: pd.DataFrame,
+                      lat: Optional[float] = None) -> pd.DataFrame:
         _weather_cols = ["temperature", "humidity", "wind_speed",
                          "wind_direction", "solar_radiation",
                          "precipitation", "pressure"]
@@ -529,7 +594,14 @@ class FeatureEngineer:
         )
         result.drop(columns=["_dt_hour"], inplace=True)
         wfe = WeatherFeatureEngineer()
-        result = wfe.transform(result)
+        result = wfe.transform(result, lat=lat)
+
+        # 气象滞后特征: 捕捉天气日间变化 (今天vs昨天同时刻)
+        for col in ["solar_radiation", "wind_speed", "temperature"]:
+            if col in result.columns:
+                result[f"{col}_lag_1d"] = result[col].shift(96)
+                result[f"{col}_diff_1d"] = result[col] - result[f"{col}_lag_1d"].fillna(result[col])
+
         return result
 
     def add_price_features(self, features: pd.DataFrame,

@@ -42,6 +42,8 @@ class Orchestrator:
         self.store = FeatureStore(self.source)
         self.trainer = Trainer()
         self.backtester = Backtester(self.trainer)
+        pred_cfg = cfg.get("predictor", {})
+        self._lookback_days = pred_cfg.get("lookback_days", 60)
         self.predictor = Predictor(self.trainer, self.store)
         self.validator = Validator()
         self.analyzer = Analyzer()
@@ -246,9 +248,11 @@ class Orchestrator:
 
                 features = self.engineer.build_features_from_raw(raw, value_type_filter="实际")
 
-                # 合并气象数据 (光伏跳过: Open-Meteo 网格点与电站位置偏差导致不准)
-                if p in weather_cache and "光伏" not in t:
-                    features = self.engineer.merge_weather(features, weather_cache[p])
+                # 合并气象数据 (含省份纬度用于 cloud_factor)
+                if p in weather_cache:
+                    coords = load_config().get("province_coords", {})
+                    lat = coords.get(p, {}).get("lat") if coords else None
+                    features = self.engineer.merge_weather(features, weather_cache[p], lat=lat)
 
                 # 注入预测误差特征 (如果有历史预测)
                 try:
@@ -464,7 +468,7 @@ class Orchestrator:
             return {"status": "no_data"}
 
         result = self.backtester.evaluate_model(
-            df, train_window_days=14, test_window_hours=24,
+            df, train_window_days=self._lookback_days, test_window_hours=24,
             province=province, target_type=target_type,
         )
 
@@ -506,7 +510,7 @@ class Orchestrator:
             return {"status": "no_data"}
 
         bt_result = self.backtester.evaluate_model(
-            bt_df, train_window_days=14, test_window_hours=24,
+            bt_df, train_window_days=self._lookback_days, test_window_hours=24,
             province=province, target_type=target_type,
         )
 
@@ -593,9 +597,15 @@ class Orchestrator:
             )
             result = self.trainer.train(df, province, target_type)
             logger.info(
-                f"  完成: n={result['n_samples']}, "
+                f"  LGB 完成: n={result['n_samples']}, "
                 f"features={result['n_features']}"
             )
+            # XGBoost 联合训练
+            try:
+                xgb_result = self.trainer.xgboost_train(df, province, target_type)
+                logger.info(f"  XGB 完成: n={xgb_result['n_samples']}")
+            except Exception as e:
+                logger.warning(f"  XGB 训练跳过 ({province}/{target_type}): {e}")
 
     def validate_data(self, province: str, target_type: str) -> Dict:
         """数据校验."""
