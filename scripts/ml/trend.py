@@ -1,11 +1,12 @@
-"""trend.py — 趋势外推模型: 双指数平滑 + 日内模式"""
+"""trend.py — 趋势外推模型: 近期加权日内模式 (Holt 基线退化为常量)."""
 import numpy as np
 
 
 class TrendModel:
-    """与 LightGBM 互补:
-    - LightGBM 擅长多维特征交互(气象/时间/滞后)
-    - TrendModel 擅长纯时序趋势和平移(结构性变化)
+    """近期加权日内模式: 用最近 7 天指数加权平均作为基线模式.
+
+    不再使用 Holt 线性外推 — 线性趋势会污染谷底时机(斜率导致相位偏移).
+    对电价等强周期型, 日内模式的相位准确性远比趋势斜率重要.
     """
 
     def __init__(self, alpha: float = 0.3, beta: float = 0.1):
@@ -17,40 +18,50 @@ class TrendModel:
     def fit(self, series: np.ndarray):
         n = len(series)
         if n < 2:
-            self.level = series[-1] if n > 0 else 0
-            self.trend = 0
+            self.level = float(series[-1]) if n > 0 else 0.0
+            self.trend = 0.0
             return
 
-        self.level = series[0]
-        self.trend = series[1] - series[0]
+        # Holt 拟合保留用于 level 估计 (仅 predict 使用常量)
+        self.level = float(series[0])
+        self.trend = float(series[1] - series[0])
 
         for i in range(1, n):
             prev_level = self.level
-            prev_trend = self.trend
-            self.level = (self.alpha * series[i] +
-                          (1 - self.alpha) * (prev_level + prev_trend))
+            self.level = (self.alpha * float(series[i]) +
+                          (1 - self.alpha) * (prev_level + self.trend))
             self.trend = (self.beta * (self.level - prev_level) +
-                          (1 - self.beta) * prev_trend)
+                          (1 - self.beta) * self.trend)
 
     def predict(self, steps: int) -> np.ndarray:
         if self.level is None:
             return np.zeros(steps)
-        return np.array([self.level + self.trend * (i + 1)
-                         for i in range(steps)])
+        # 常量基线: 退化为 level, 不做线性外推
+        return np.full(steps, self.level)
 
     def predict_with_daily_pattern(self, steps: int,
                                     history: np.ndarray = None) -> np.ndarray:
+        """近期加权日内模式 + 常量基线.
+
+        history: 历史 value 数组 (最近在最右).
+        取最近 7 天做指数加权日模式, 越近权重越大.
+        不叠加 Holt 趋势 — 避免相位偏移.
+        """
         base = self.predict(steps)
 
         if history is not None and len(history) >= 96:
-            pattern = np.zeros(96)
-            days = len(history) // 96
-            if days > 0:
-                reshaped = history[-days * 96:].reshape(days, 96)
-                daily_mean = np.mean(reshaped, axis=0)
-                pattern = daily_mean - np.mean(daily_mean)
+            pts_per_day = 96
+            total_days = len(history) // pts_per_day
+            use_days = min(total_days, 7)
 
-            for i in range(min(steps, 96 * 7)):
-                base[i] += pattern[i % 96]
+            if use_days > 0:
+                reshaped = history[-use_days * pts_per_day:].reshape(use_days, pts_per_day)
+                weights = np.exp(-np.arange(use_days)[::-1] * 0.4)
+                weights /= weights.sum()
+                daily_pattern = np.average(reshaped, axis=0, weights=weights)
+                pattern = daily_pattern - np.mean(daily_pattern)
+
+                for i in range(steps):
+                    base[i] += pattern[i % pts_per_day]
 
         return base

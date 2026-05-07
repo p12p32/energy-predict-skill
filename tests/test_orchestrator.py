@@ -4,8 +4,8 @@ import numpy as np
 import pandas as pd
 import tempfile
 import os
-from datetime import datetime, timedelta
-from unittest.mock import MagicMock, patch
+from datetime import timedelta
+from unittest.mock import MagicMock
 
 
 # ============================================================
@@ -50,14 +50,10 @@ def orch():
     orch = Orchestrator.__new__(Orchestrator)
     orch.source = source
     orch.store = FeatureStore(source)
-    orch.trainer = MagicMock()
-    orch.predictor = MagicMock()
-    orch.backtester = MagicMock()
-    orch.validator = MagicMock()
-    orch.analyzer = MagicMock()
-    orch.improver = MagicMock()
+    orch.model_dir = tempfile.mkdtemp()
     orch.engineer = MagicMock()
     orch._validator_history = []
+    orch._lookback_days = 60
     return orch
 
 
@@ -107,31 +103,6 @@ class TestValidateData:
 
 
 # ============================================================
-# TestExplain
-# ============================================================
-
-class TestExplain:
-    def test_returns_top_features(self, orch):
-        orch.trainer.feature_importance = MagicMock(return_value=[
-            {"rank": i + 1, "feature": f"f{i}", "importance": 0.1, "pct": 10.0}
-            for i in range(20)
-        ])
-        orch.trainer.list_versions = MagicMock(return_value=[])
-        result = orch.explain("广东", "load")
-        assert len(result["feature_importance"]) <= 15
-        assert "model_versions" in result
-
-    def test_returns_version_list(self, orch):
-        orch.trainer.feature_importance = MagicMock(return_value=[])
-        orch.trainer.list_versions = MagicMock(return_value=[
-            {"version": 0, "filename": "v1.lgbm"},
-            {"version": 1, "filename": "v2.lgbm"},
-        ])
-        result = orch.explain("广东", "load")
-        assert len(result["model_versions"]) == 2
-
-
-# ============================================================
 # TestExport
 # ============================================================
 
@@ -166,45 +137,3 @@ class TestExport:
         assert result == "无预测数据"
 
 
-# ============================================================
-# TestRollback
-# ============================================================
-
-class TestRollback:
-    def test_delegates_to_trainer(self, orch):
-        orch.trainer.rollback = MagicMock(return_value={
-            "status": "rolled_back",
-            "removed_version": "old.lgbm",
-            "current_version": "new.lgbm",
-        })
-        result = orch.rollback_model("广东", "load")
-        orch.trainer.rollback.assert_called_once_with("广东", "load")
-        assert result["status"] == "rolled_back"
-
-
-# ============================================================
-# TestChart
-# ============================================================
-
-class TestChart:
-    def test_returns_ascii_chart(self, orch):
-        samples = [
-            {"dt": str(datetime.now() + timedelta(hours=i)), "p50": 100 + i * 5}
-            for i in range(24)
-        ]
-        orch.predictor.predict = MagicMock()
-        # 需要 mock 整个 predict 方法
-        with patch.object(orch, "predict", return_value={
-            "province": "广东", "type": "load",
-            "horizon_hours": 24, "n_predictions": 96,
-            "sample": samples,
-        }):
-            result = orch.chart("广东", "load")
-        assert "广东" in result
-        assert "load" in result
-        assert "█" in result or "│" in result or "─" in result
-
-    def test_empty_returns_message(self, orch):
-        with patch.object(orch, "predict", return_value={"sample": []}):
-            result = orch.chart("广东", "load")
-        assert result == "无预测数据"

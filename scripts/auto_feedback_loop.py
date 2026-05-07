@@ -65,32 +65,39 @@ def mark_skipped(vnum: int, reason: str = ""):
 def run_predictions(version: int):
     """运行所有预测并输出到 v{version}/."""
     sys.path.insert(0, PROJ_DIR)
-    from scripts.ml.predictor import Predictor
+    from scripts.ml.pipeline import LayeredPipeline
 
     out_dir = os.path.join(CLAUDE_DIR, f"v{version}")
     os.makedirs(out_dir, exist_ok=True)
 
-    with open(os.path.join(PROJ_DIR, "models/model_registry.json")) as f:
+    reg_path = os.path.join(PROJ_DIR, "models/model_registry.json")
+    if not os.path.exists(reg_path):
+        print("模型注册表不存在，跳过预测")
+        return {"ok": 0, "fail": 0}
+
+    with open(reg_path) as f:
         reg = json.load(f)
 
     # 确定日期范围: 最新数据日期 + 接下来3天
     dates = ["2026-04-27", "2026-04-28", "2026-04-29"]
-    p = Predictor()
+    pipeline = LayeredPipeline()
     results = {"ok": 0, "fail": 0}
 
-    for key, entry in sorted(reg.items()):
-        if key == "广东_load":
+    # 只使用 layered 注册的模型
+    layered = reg.get("layered", {})
+    for key, entry in sorted(layered.items()):
+        if "广东_load" in key:
             continue
         parts = key.split("_", 1)
         province = parts[0]
-        target_type = entry.get("type_parts", entry.get("target_type", parts[1]))
+        target_type = entry.get("target_type", parts[1]) if isinstance(entry, dict) else parts[1]
 
         for date_str in dates:
             fname = f"{province}_{target_type}_{date_str}.txt"
             fpath = os.path.join(out_dir, fname)
 
             try:
-                result = p.predict(
+                result = pipeline.predict(
                     province=province, target_type=target_type,
                     reference_date=date_str, horizon_hours=24,
                 )

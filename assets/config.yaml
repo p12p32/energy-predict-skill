@@ -27,6 +27,56 @@ model:
   default_window_days: 90
   forecast_horizon_hours: 96
 
+# 分层预测架构 (State→Level→Delta→TS→Fusion→Constraints)
+layers:
+  # State 层 — 二分类: 风电/光伏出力是否>噪声阈值
+  state:
+    noise_threshold_pct: 5.0          # 噪声阈值 (正值的 Q05 分位数)
+    classifier:
+      n_estimators: 300
+      num_leaves: 31
+      learning_rate: 0.03
+      class_weight: balanced
+
+  # Level 层 — 绝对水平回归 + 自适应变换
+  level:
+    n_estimators: 500
+    num_leaves: 31
+    learning_rate: 0.03
+    transform_candidates: [identity, log, log_plus_C, asinh, yeo_johnson]
+
+  # Delta 层 — 相对误差短期修正
+  delta:
+    n_estimators: 300
+    num_leaves: 31
+    learning_rate: 0.03
+    delta_eps: 1.0                     # 防止除零
+
+  # TS 层 — 纯时序 LGB (仅 lag/rolling/diff 特征)
+  ts:
+    n_estimators: 300
+    num_leaves: 31
+    learning_rate: 0.03
+
+  # Fusion 融合层 — Stacking 第二层
+  fusion:
+    n_estimators: 200
+    num_leaves: 15
+    learning_rate: 0.02
+
+  # 物理约束
+  constraints:
+    non_negative: true                  # 出力/负荷非负
+    pv_night_zero: true                 # 光伏夜间归零
+    wind_power_curve: false             # 风电功率曲线上限 (需配置曲线)
+    line_capacity: false                # 联络线容量限制 (需配置容量)
+
+  # 训练配置
+  oof_splits: 5                         # KFold OOF 折数
+  train_ratio: 0.70                     # S1 训练集比例
+  holdout_ratio: 0.20                   # S2 融合训练集比例
+  # S3 = 1 - train_ratio - holdout_ratio = 0.10
+
 # 预测器参数 (Predictor v2)
 predictor:
   lookback_days: 30               # 训练数据回溯天数 (最少14天自动降级)
@@ -67,6 +117,25 @@ types:
   - 出力
   - 负荷
   - 电价
+
+# 数据可用性延迟 — 按 value_type 定义各类型数据相对"今天"的可用延迟 (天)
+# delay_days < 0: 提前可用 (如日前预测 D+1 → -1)
+# delay_days > 0: 延迟到库 (如实际值 D-1 → 1, 结算 D-6 → 6)
+# "今天" = daemon 运行日期, 并非自然日
+data_availability:
+  # 默认规则 (按 value_type 后缀匹配)
+  default_delays:
+    预测: -1      # 日前预测值, 提前 1 天发布 (D+1)
+    实际: 1       # 实际运行值, 延后 1 天到库 (D-1)
+    结算: 6       # 结算数据, 延后 6 天到库 (D-6)
+
+  # 类型级覆盖 (base_sub 匹配, 优先级高于 default_delays)
+  type_overrides:
+    电价_实时: 1   # 实时出清电价, D-1
+    电价_结算: 6   # 结算数据, D-6
+
+  # 省份级覆盖 (province + base_sub 匹配, 优先级最高)
+  province_overrides: {}
 
 province_coords:
   广东: { lat: 23.13, lon: 113.26 }
@@ -163,3 +232,54 @@ cross_type_rules:
     - name: price_pressure_index
       formula: "supply_demand_ratio * coal_price"
       description: "供需紧张 + 煤价高 → 电价上行压力"
+
+# ── 混合物理+ML 管线配置 ──
+hybrid:
+  enabled: true
+  pipeline_mode: "both"       # "layered" | "hybrid" | "both"
+                               # layered: 现有分层管线 (默认)
+                               # hybrid:  新物理+ML管线
+                               # both:    双跑对比
+
+  physics:
+    solar:
+      model_type: "parametric"  # "parametric" | "lightgbm"
+      capacity_mw: null         # null = 从数据自动检测
+      eta0: 0.18                # 初始面板效率
+      temp_coef: -0.004         # 每°C 效率衰减 (>25°C)
+      cloud_alpha: 1.0          # 云量衰减斜率
+      cloud_gamma: 0.0          # 云量衰减截距
+
+    wind:
+      model_type: "parametric"
+      capacity_mw: null
+      v_cut_in: 3.0             # 切入风速 m/s
+      v_rated: 12.0             # 额定风速 m/s
+      v_cut_out: 25.0           # 切出风速 m/s
+      directional_factors: null # null = 自动拟合
+
+    load:
+      decomposition: "stl"      # "stl" | "moving_average"
+      weather_model: "lightgbm"
+      stl_period: 96            # 96=15min, 24=1h
+      stl_seasonal: 7           # 周周期
+      stl_robust: true
+
+    price:
+      model: "lightgbm"         # 电价用 ML, net_load 为主特征
+
+  transformer:
+    enabled: false              # 默认关闭, PyTorch 验证后开启
+    d_model: 128
+    n_heads: 8
+    n_layers: 3
+    seq_len: 96
+    horizon: 96
+    dropout: 0.1
+    learning_rate: 0.001
+    batch_size: 32
+    epochs: 50
+    early_stopping_patience: 10
+
+  net_load:
+    central_variable: true      # 净负荷为一等公民变量

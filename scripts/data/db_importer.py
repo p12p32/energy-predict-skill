@@ -58,7 +58,6 @@ class EnergyDBImporter:
         2: ("出力", "实际"),
         3: ("负荷", "预测"),
         4: ("负荷", "实际"),
-        5: ("电价", "实际"),  # 出清电量
     }
 
     # power_source_id → sub_type (简化中文名)

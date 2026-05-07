@@ -2,6 +2,7 @@
 import os
 import glob
 import yaml
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -199,6 +200,57 @@ def get_available_actual_types(province: str) -> List[str]:
     cfg = load_config()
     vt_actual = set(cfg.get("value_types", {}).values())
     return [t for t in all_types if not any(t.endswith(f"_{v}") for v in vt_actual) or t.endswith("_实际")]
+
+
+def get_data_delay(province: str, target_type: str) -> int:
+    """返回该 province/type 的数据可用延迟天数.
+
+    负值 = 提前可用 (如日前预测 D+1 → -1)
+    正值 = 延迟到库 (如实际值 D-1 → 1, 结算 D-6 → 6)
+    0 = 当天可用.
+
+    匹配优先级: province_overrides > type_overrides > default_delays(value_type)
+    """
+    cfg = load_config()
+    da_cfg = cfg.get("data_availability", {})
+    if not da_cfg:
+        return 0
+
+    ti = parse_type(target_type)
+    base_sub = f"{ti.base}_{ti.sub}" if ti.sub else ti.base
+
+    # 1) 省份级覆盖 (最高优先级)
+    prov_overrides = da_cfg.get("province_overrides", {})
+    if province in prov_overrides and base_sub in prov_overrides[province]:
+        return int(prov_overrides[province][base_sub])
+
+    # 2) 类型级覆盖
+    type_overrides = da_cfg.get("type_overrides", {})
+    if base_sub in type_overrides:
+        return int(type_overrides[base_sub])
+
+    # 3) 默认规则 (按 value_type 后缀)
+    default_delays = da_cfg.get("default_delays", {})
+    for vt_suffix, delay in default_delays.items():
+        if ti.value_type == vt_suffix:
+            return int(delay)
+
+    return 0
+
+
+def get_available_date(province: str, target_type: str,
+                       reference_date: Optional[datetime] = None) -> datetime:
+    """返回该 province/type 在 reference_date 时实际可用的最新数据日期.
+
+    reference_date: 运行日期 (默认今天)
+    返回: reference_date - delay_days
+    """
+    from datetime import date as _date_type
+    delay = get_data_delay(province, target_type)
+    ref = reference_date if reference_date is not None else datetime.now()
+    if isinstance(ref, _date_type) and not isinstance(ref, datetime):
+        ref = datetime.combine(ref, datetime.min.time())
+    return ref - timedelta(days=delay)
 
 
 def validate_province_and_type(province: str, target_type: str) -> None:

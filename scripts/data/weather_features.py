@@ -65,6 +65,15 @@ class WeatherFeatureEngineer:
             ws = result["wind_speed"]
             result["wind_power_potential"] = ws ** 3
 
+            # 风功率曲线 (S型, 归一化 0-1):
+            # 切入 3m/s, 额定 12m/s, 切出 25m/s
+            result["wind_power_curve"] = np.where(
+                ws < 3, 0,
+                np.where(ws > 25, 0,
+                np.where(ws >= 12, 1,
+                ((ws - 3) / 9) ** 3))
+            )
+
         # ── 光伏潜力 ──
         if "solar_radiation" in result.columns:
             result["solar_potential"] = result["solar_radiation"]

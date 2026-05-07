@@ -22,7 +22,7 @@ if "--crontab" in sys.argv:
     sys.exit(0)
 
 from scripts.orchestrator import Orchestrator
-from scripts.core.config import get_provinces, get_available_types, load_config
+from scripts.core.config import get_provinces, get_available_types, load_config, get_data_delay, get_available_date
 from scripts.core.monitoring import MonitoringServer, record_prediction
 
 logging.basicConfig(
@@ -66,20 +66,19 @@ class Daemon:
         except Exception as e:
             logger.warning(f"特征构建失败 (将使用已有特征): {e}")
 
-        # 2. 扫描数据 + 全量训练
+        # 2. 扫描数据 + 全量训练 (分层架构)
         try:
-            available = self.orch._scan_available()
-            if available:
-                self.orch.train_all()
-                logger.info(f"训练完成: {len(available)} 组")
-            else:
+            result = self.orch.train_all_layered()
+            if result.get("status") == "no_data":
                 logger.warning("无可用数据, 跳过训练")
                 return
+            trained = len(result.get("results", {}))
+            logger.info(f"分层训练完成: {trained} 组")
         except Exception as e:
             logger.error(f"训练失败: {e}")
             return
 
-        # 3. 预测 + 验证 + 自优化
+        # 3. 预测 + 输出
         self._predict_and_validate()
 
         # 4. 输出总结
@@ -88,35 +87,54 @@ class Daemon:
         if self._monitor:
             self._monitor.stop()
 
+    def _check_data_ready(self, province: str, target_type: str) -> bool:
+        """检查该 province/type 的数据是否已就绪 (基于 data_availability 延迟配置)."""
+        delay = get_data_delay(province, target_type)
+        avail_date = get_available_date(province, target_type)
+
+        # 延迟 <= 0 表示提前可用 (如日前预测), 始终就绪
+        if delay <= 0:
+            return True
+
+        # 延迟 > 0: 检查实际最新数据是否已到达 avail_date
+        latest = self.orch._find_latest_date(province, target_type)
+        if latest is None:
+            logger.warning("[数据就绪] %s/%s: 无已有数据, 延迟=%+dd, 期望截止=%s",
+                          province, target_type, delay,
+                          avail_date.strftime("%Y-%m-%d"))
+            return False
+
+        ready = latest >= avail_date
+        if not ready:
+            logger.info("[数据就绪] %s/%s: 未就绪 (最新=%s, 期望>=%s, 延迟=%+dd), 跳过",
+                       province, target_type,
+                       latest.strftime("%Y-%m-%d"),
+                       avail_date.strftime("%Y-%m-%d"),
+                       delay)
+        return ready
+
     def _predict_and_validate(self):
+        skipped = 0
         for province in get_provinces():
             for target_type in get_available_types(province):
                 key = f"{province}_{target_type}"
+
+                # 数据就绪检查
+                if not self._check_data_ready(province, target_type):
+                    skipped += 1
+                    continue
+
                 try:
-                    result = self.orch.predict(province, target_type, 24)
-                    health = result.get("health", {})
-                    record_prediction(province, target_type,
-                                      health.get("mape", 0) or 0,
-                                      result.get("n_predictions", 0),
-                                      health.get("status", "ok"))
-
-                    # 验证 + 退化检测 → 自动优化
-                    val = self.orch.run_validation_cycle(province, target_type)
-                    mape = None
-                    if val.get("status") == "improved":
-                        imp = val.get("improvement", {})
-                        logger.info(f"[{key}] 自动优化: "
-                                    f"策略={imp.get('selected_strategy')}, "
-                                    f"MAPE {imp.get('mape_before')}→{imp.get('mape_after')}")
-                    elif "report" in val:
-                        mape = val["report"]["metrics"].get("mape")
-                        logger.info(f"[{key}] 验证: MAPE={mape}")
-
-                    if mape is not None:
-                        self.last_mape[key] = mape
+                    df = self.orch.predict_layered(province, target_type, 24)
+                    n = len(df)
+                    record_prediction(province, target_type, 0, n, "ok")
+                    logger.info(f"[{key}] 预测完成: {n} 步")
 
                 except Exception as e:
                     logger.error(f"[{key}] 异常: {e}")
+
+        if skipped > 0:
+            logger.info("数据就绪检查: %d 个类型因数据未到库跳过", skipped)
 
 
     def _print_summary(self):
